@@ -98,6 +98,9 @@ export default function (pi: ExtensionAPI) {
 		refreshConsultCatalog(currentCatalog);
 	});
 
+	let deactivatePublicApi: () => void = () => undefined;
+	// Pi awaits shutdown handlers in registration order, so stop new API work before agent cleanup.
+	pi.on("session_shutdown", () => deactivatePublicApi());
 	const statefulRuntime = registerStatefulSubagents(pi, {
 		blockingEnabled,
 		settings: settings?.stateful,
@@ -105,7 +108,7 @@ export default function (pi: ExtensionAPI) {
 		ceilings,
 	});
 	refreshStatefulCatalog = statefulRuntime.setAgentCatalog;
-	registerPiSubagentsV1Api(pi, ceilings, {
+	deactivatePublicApi = registerPiSubagentsV1Api(pi, ceilings, {
 		preflight: (payload, ctx) => ({
 			...preflightPublicDelegation(payload, ctx, currentSettings, ceilings),
 			lifecycleArtifact: statefulRuntime.getLifecycleArtifactStatus(),

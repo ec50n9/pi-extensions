@@ -496,6 +496,7 @@ async function showSubagentManager(
 					ctx.ui.notify("Subagent follow-up started.", "info");
 					return { kind: "stay" };
 				} catch (error) {
+					if (signal.aborted || !isCurrent()) return { kind: "close" };
 					ctx.ui.notify(`Follow-up was not started: ${formatError(error)}`, "error");
 					return { kind: "rejected" };
 				}
@@ -513,12 +514,15 @@ async function showSubagentManager(
 					ctx.ui.notify("Mailbox message queued.", "info");
 					return { kind: "stay" };
 				} catch (error) {
+					if (signal.aborted || !isCurrent()) return { kind: "close" };
 					ctx.ui.notify(`Mailbox message was not queued: ${formatError(error)}`, "error");
 					return { kind: "rejected" };
 				}
 			},
-			"agent-interrupt": async () => applyAgentInterrupt(runtime, selectedAgentId, false, ctx),
-			"agent-interrupt-tree": async () => applyAgentInterrupt(runtime, selectedAgentId, true, ctx),
+			"agent-interrupt": async ({ signal }) =>
+				applyAgentInterrupt(runtime, selectedAgentId, false, ctx, signal, isCurrent),
+			"agent-interrupt-tree": async ({ signal }) =>
+				applyAgentInterrupt(runtime, selectedAgentId, true, ctx, signal, isCurrent),
 			"agent-close": async ({ signal }) =>
 				applyAgentClose(runtime, selectedAgentId, false, ctx, signal, isCurrent),
 			"agent-close-tree": async ({ signal }) =>
@@ -779,13 +783,17 @@ async function applyAgentInterrupt(
 	agentId: string | undefined,
 	subtree: boolean,
 	ctx: ExtensionCommandContext,
+	signal: AbortSignal,
+	isCurrent: () => boolean,
 ) {
 	if (!agentId || !runtime.interruptAgent) return { kind: "rejected" as const };
 	try {
 		const count = await runtime.interruptAgent(agentId, subtree);
+		if (signal.aborted || !isCurrent()) return { kind: "close" as const };
 		ctx.ui.notify(`Interrupted ${count} active subagent${count === 1 ? "" : "s"}.`, "info");
 		return { kind: "stay" as const };
 	} catch (error) {
+		if (signal.aborted || !isCurrent()) return { kind: "close" as const };
 		ctx.ui.notify(`Subagent was not interrupted: ${formatError(error)}`, "error");
 		return { kind: "rejected" as const };
 	}
@@ -821,6 +829,7 @@ async function applyAgentClose(
 		ctx.ui.notify(`Closed ${closed} subagent${closed === 1 ? "" : "s"}.`, "info");
 		return { kind: "to" as const, screen: "agents" as const };
 	} catch (error) {
+		if (signal.aborted || !isCurrent()) return { kind: "close" as const };
 		ctx.ui.notify(`Subagent was not closed: ${formatError(error)}`, "error");
 		return { kind: "rejected" as const };
 	}

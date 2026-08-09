@@ -301,6 +301,146 @@ test("public preflight returns a side-effect-free launch contract without adding
 	}
 });
 
+test("the event API deactivates before awaited stateful shutdown", async () => {
+	const directory = mkdtempSync(path.join(os.tmpdir(), "pi-subagents-api-shutdown-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = directory;
+	try {
+		const mock = createMockPi();
+		subagents(mock.pi);
+		const context = createMockContext({ cwd: directory });
+		const replies: unknown[] = [];
+		mock.eventBus.on(PI_SUBAGENTS_V1_REPLY, (reply) => replies.push(reply));
+		for (const handler of mock.events.get("session_start") ?? []) {
+			await handler({}, context.ctx);
+		}
+		mock.eventBus.emit(PI_SUBAGENTS_V1_REQUEST, {
+			requestId: "before-shutdown",
+			method: "ping",
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(replies.length, 1);
+
+		const shutdownHandlers = mock.events.get("session_shutdown") ?? [];
+		assert.ok(shutdownHandlers.length >= 3);
+		await shutdownHandlers[0]?.({}, context.ctx);
+		const secondShutdown = Promise.resolve(shutdownHandlers[1]?.({}, context.ctx));
+		try {
+			mock.eventBus.emit(PI_SUBAGENTS_V1_REQUEST, {
+				requestId: "during-shutdown",
+				method: "ping",
+			});
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(replies.length, 1, "the public listener must stop before stateful cleanup");
+		} finally {
+			await secondShutdown;
+			for (const handler of shutdownHandlers.slice(2)) await handler({}, context.ctx);
+		}
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("stale interrupt completion never notifies through a replaced menu context", async () => {
+	const agent: ManagedAgent = {
+		id: "running-agent",
+		agent: "worker",
+		rootId: "running-agent",
+		depth: 0,
+		children: [],
+		state: "running",
+		createdAt: 1,
+		updatedAt: 1,
+		cwd: process.cwd(),
+		history: [],
+		mailbox: [],
+	};
+	for (const outcome of ["resolve", "reject"] as const) {
+		const mock = createMockPi();
+		let resolveInterrupt!: (count: number) => void;
+		let rejectInterrupt!: (error: Error) => void;
+		let markStarted!: () => void;
+		const started = new Promise<void>((resolve) => {
+			markStarted = resolve;
+		});
+		const interruption = new Promise<number>((resolve, reject) => {
+			resolveInterrupt = resolve;
+			rejectInterrupt = reject;
+		});
+		const runtime: SubagentSettingsRuntime = {
+			getBlockingEnabled: () => true,
+			getMaxParallelTasks: () => 8,
+			getCompletionDelivery: () => "next-turn",
+			getConsultResourcePolicy: () => "project-context",
+			getConsultationCwdPolicy: () => "anywhere",
+			getDelegationCwdPolicy: () => "trusted-targets",
+			setMaxParallelTasks: () => undefined,
+			setCompletionDelivery: () => undefined,
+			setConsultResourcePolicy: () => undefined,
+			setConsultationCwdPolicy: () => undefined,
+			setDelegationCwdPolicy: () => undefined,
+			getRuntimeStatus: () => ({
+				enabled: true,
+				initialized: true,
+				transport: "subprocess",
+				completionDelivery: "next-turn",
+				limits: resolveStatefulLimits(),
+				activeAgents: 1,
+				retainedAgents: 1,
+			}),
+			listAgents: () => [agent],
+			interruptAgent: async () => {
+				markStarted();
+				return interruption;
+			},
+			clearAgents: async () => 0,
+		};
+		registerSubagentConfigCommand(mock.pi, runtime);
+		const command = mock.commands.get("subagents");
+		assert.ok(command);
+		let call = 0;
+		const context = createMockContext({
+			mode: "tui",
+			hasUI: true,
+			custom: async (factory: unknown) => {
+				const harness = createCustomSelectorHarness(factory, 60);
+				const frame = stripVTControlCharacters(harness.render().join("\n"));
+				if (call === 0) {
+					assert.match(frame, /Subagents/);
+					harness.handleInput("tui.select.down");
+					harness.handleInput("tui.select.confirm");
+				} else if (call === 1) {
+					assert.match(frame, /Current-session Subagents/);
+					harness.handleInput("tui.select.confirm");
+				} else if (call === 2) {
+					assert.match(frame, /worker · running/);
+					harness.handleInput("tui.select.down");
+					harness.handleInput("tui.select.confirm");
+					await harness.waitForPending();
+				} else {
+					harness.handleInput("\u0003");
+				}
+				call++;
+				return harness.result;
+			},
+		});
+		for (const handler of mock.events.get("session_start") ?? []) {
+			await handler({}, context.ctx);
+		}
+		const commandRun = command.handler("", context.ctx);
+		await started;
+		for (const handler of mock.events.get("session_shutdown") ?? []) {
+			await handler({}, context.ctx);
+		}
+		if (outcome === "resolve") resolveInterrupt(1);
+		else rejectInterrupt(new Error("interrupt failed"));
+		await commandRun;
+		assert.deepEqual(context.notifications, [], `${outcome} used a stale UI context`);
+	}
+});
+
 test("bare subagents opens a current-session manager and keeps direct routes predictable", async () => {
 	const directory = mkdtempSync(path.join(os.tmpdir(), "pi-subagents-manager-"));
 	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

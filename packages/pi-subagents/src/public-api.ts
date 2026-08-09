@@ -98,7 +98,7 @@ export function registerPiSubagentsV1Api(
 	pi: ExtensionAPI,
 	ceilings: CapabilityCeilingRegistry,
 	dependencies: PublicApiDependencies,
-): void {
+): () => void {
 	let generation = 0;
 	let disposeRequest: (() => void) | undefined;
 	let currentContext: ExtensionContext | undefined;
@@ -257,6 +257,7 @@ export function registerPiSubagentsV1Api(
 	});
 
 	pi.on("session_shutdown", () => reset());
+	return reset;
 }
 
 function parseRequest(
