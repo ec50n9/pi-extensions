@@ -18,7 +18,9 @@ Use it to split independent research, planning, implementation, and review work 
 - Supports built-in `scout`, `planner`, `reviewer`, and `worker` agents.
 - Loads custom user agents from `~/.pi/agent/agents/*.md`.
 - Optionally loads project agents from `.pi/agents/*.md` with confirmation.
-- Provides a current-session-first `/subagents` manager, direct `settings|status|help` routes, and compatibility aliases for agent tools and retained agents.
+- Provides a current-session-first `/subagents` manager with per-agent follow-up, mailbox, interrupt, close, and subtree actions.
+- Offers an opt-in read-only active-agent FleetView below the editor without capturing terminal input.
+- Exposes an optional versioned `pi-subagents:v1` event API for preflight, one-leaf foreground delegation, cancellation, and session-scoped capability ceilings.
 - Supports trust-aware per-task `cwd` policies, hard subprocess `timeoutMs`, task-selected `thinkingLevel`, abort propagation, and streaming progress.
 - Renders all seven tools with Pi-native compact/expanded transcript rows; long-running blocking and consultation calls show bounded live activity.
 - Bounds JSON lines, captured messages, stderr, final output, chain substitution, and fan-in context.
@@ -361,7 +363,7 @@ Detached-limit saves are durable immediately but apply to the runtime after `/re
 Escape returns from a nested screen to a newly refreshed manager, while Ctrl+C closes the full flow.
 Exact workflow/reload and project-agent safety confirmations remain extension-owned because they guard live agent and trust-boundary policy rather than ordinary navigation.
 
-The direct routes remain predictable: `/subagents settings` changes both target policies, consultation resources, and completion delivery and applies them immediately, including refreshing model-facing tool guidance; `/subagents status` reports current-session runtime values separately from configured values, per-field sources, and path; `/subagents help` summarizes the single-command interface and the non-sandbox limitation. In RPC mode, bare `/subagents` emits the same bounded status through Pi's notification protocol instead of opening a custom TUI. JSON and print modes do not emit ad hoc command output. Manual edits use `~/.pi/agent/pi-subagents.json` and take effect after reloading Pi:
+The direct routes remain predictable: `/subagents settings` changes target policies, consultation resources, completion delivery, FleetView, and lifecycle-artifact publication; launch and FleetView changes apply immediately, while lifecycle artifacts apply after reload; `/subagents status` reports current-session runtime values separately from configured values, per-field sources, and path; `/subagents help` summarizes the single-command interface and the non-sandbox limitation. In RPC mode, bare `/subagents` emits the same bounded status through Pi's notification protocol instead of opening a custom TUI. JSON and print modes do not emit ad hoc command output. Manual edits use `~/.pi/agent/pi-subagents.json` and take effect after reloading Pi:
 
 ```json
 {
@@ -381,7 +383,9 @@ The direct routes remain predictable: `/subagents settings` changes both target 
     "maxMailboxMessageBytes": 16384,
     "idleTtlMs": 3600000,
     "retentionDays": 30,
-    "maxStoredAgents": 50
+    "maxStoredAgents": 50,
+    "fleetView": "off",
+    "lifecycleArtifacts": "off"
   },
   "cwdPolicy": {
     "consultation": "anywhere",
@@ -439,12 +443,25 @@ The action schemas are flat for provider compatibility and reject parameters tha
 }
 ```
 
-Use the **Current agents** action in `/subagents` to inspect the indented agent tree, lifecycle state, unread count, and available actions, or to confirm clearing retained agents.
+Use the **Current agents** action in `/subagents` to select a retained agent, inspect its lifecycle metadata, send a follow-up, queue a mailbox message, interrupt active work, close resources, apply subtree variants, or confirm clearing all retained agents.
+The manager revalidates the selected agent after prompts and confirmations so cancellation, session replacement, and concurrent lifecycle changes do not apply stale actions.
+Set `stateful.fleetView` to `"active"` for an opt-in read-only widget that shows at most five `STARTING` or `RUNNING` agents plus an omission count below the editor.
+FleetView never captures terminal input, clears its own widget slot when empty or disabled, and does not run in RPC, JSON, or print mode.
 Active turns are FIFO-limited by `maxActiveTurns`; excess retained work remains in `starting` state until a slot is available.
 `maxAgents` separately bounds running, queued, and idle records.
 `maxChildrenPerAgent` bounds direct children, while `maxDepth` counts nested levels below a depth-zero root.
 `maxStoredAgents` bounds sanitized records persisted per session and does not increase live runtime capacity.
 `parentId` creates a bounded child relationship; subtree interrupt and close operate child-first.
+
+### Additive event API, ceilings, evidence, and artifacts
+
+The package now provides a process-local `pi-subagents:v1` event API for trusted extensions without adding another model-facing tool.
+Use `ping` for discovery, `preflight` for a side-effect-free launch contract, `delegate` for one foreground ephemeral subprocess leaf, `cancel` for one exact request, and the ceiling methods to narrow future agent, tool, or extension capabilities.
+No registered ceiling preserves the previous launch policy, while multiple ceilings intersect allow-lists and can never bypass project trust, target policy, consultation read-only tools, or shared-write protection.
+Passing `evidence: "attested"` to blocking work, detached spawn, or public delegation asks the child for bounded structured metadata while preserving ordinary output and execution status.
+Evidence is explicitly unverified and reports only `attested`, `missing`, or `invalid`.
+Set `stateful.lifecycleArtifacts` to `"metadata"` and reload to publish a private bounded status projection without task, prompt, output, error, mailbox, context, credential, environment, or process data.
+See [`docs/event-api.md`](./docs/event-api.md) for channels, DTO behavior, cancellation, ceiling semantics, evidence limits, artifact retention, and cleanup.
 
 ### Migrating from the previous seven-tool lifecycle surface
 
@@ -693,6 +710,12 @@ packages/pi-subagents/
 │   ├── cwd-policy.ts             # Canonical target and saved-trust resolution
 │   ├── safe-text.ts              # Shared byte/line/path sanitization
 │   ├── stateful.ts               # Detached lifecycle registration and dispatch
+│   ├── public-api.ts              # Versioned process-local event protocol and DTOs
+│   ├── launch-contract.ts         # Shared safe preflight and execution projection
+│   ├── capability-ceiling.ts      # Session-scoped least-capability intersections
+│   ├── evidence.ts                # Optional bounded child evidence attestation
+│   ├── fleet-view.ts              # Opt-in read-only active-agent widget
+│   ├── lifecycle-artifacts.ts     # Optional private metadata projection
 │   ├── stateful-guidance.ts      # Detached model-facing workflow guidance
 │   ├── stateful-lifecycle.ts     # Runtime disposal and spawn ownership guards
 │   ├── stateful-limit-ui.ts      # Detached capacity settings and recovery previews
@@ -700,16 +723,19 @@ packages/pi-subagents/
 │   ├── stateful-safety.ts        # Project-agent and shared-write safety checks
 │   ├── stateful-tool-params.ts   # Consolidated action schemas and validation
 │   └── *.ts                      # Package-local discovery, execution, rendering, and settings modules
+├── docs/
+│   └── event-api.md              # Public event API, ceilings, evidence, and artifact contract
 ├── README.md
 ├── LICENSE
 ├── tsconfig.json
 └── package.json
 ```
 
-`index.ts` is the Pi entrypoint and forwards to `subagents.ts`; the other source modules are internal.
+`index.ts` is the Pi entrypoint and forwards to `subagents.ts`.
+`public-api.ts` is also published through the side-effect-free `@narumitw/pi-subagents/api` subpath, while the other source modules remain internal.
 Workflow settings remain backward compatible: older files without `blocking.enabled` receive the seven-tool default, and an absent `blocking.maxParallelTasks` keeps the previous eight-worker limit.
 Existing `stateful.enabled: false` files expose blocking delegation plus inspection/consultation.
-Older package releases ignore and preserve the optional `blocking.maxParallelTasks`, `consult`, and `cwdPolicy` fields.
+Older package releases ignore and preserve the optional `blocking.maxParallelTasks`, `consult`, `cwdPolicy`, `stateful.fleetView`, and `stateful.lifecycleArtifacts` fields.
 The package exposes its Pi extension through `package.json`:
 
 ```json

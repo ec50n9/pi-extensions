@@ -8,6 +8,8 @@ import {
 	inspectBlockingParallelLimitSettings,
 	inspectConsultResourceSettings,
 	inspectCwdPolicySettings,
+	inspectFleetViewSettings,
+	inspectLifecycleArtifactSettings,
 	inspectStatefulLimitSettings,
 	inspectSubagentSettings,
 	normalizeSubagentSettings,
@@ -15,6 +17,8 @@ import {
 	updateBlockingMaxParallelTasksSetting,
 	updateConsultResourceSetting,
 	updateCwdPolicySetting,
+	updateFleetViewSetting,
+	updateLifecycleArtifactSetting,
 	updateStatefulLimitSetting,
 } from "../src/settings.js";
 import { resolveStatefulLimits } from "../src/stateful-limits.js";
@@ -50,6 +54,47 @@ test("consult resources normalize strictly and default without creating settings
 		assert.equal(inspected.path, path.join(directory, "pi-subagents.json"));
 		assert.equal(readSubagentSettings(), undefined);
 		assert.throws(() => readFileSync(inspected.path, "utf8"), /ENOENT/);
+	});
+});
+
+test("additive fleet and lifecycle settings default off and preserve unknown fields", () => {
+	withAgentDir((directory) => {
+		const configPath = path.join(directory, "pi-subagents.json");
+		assert.deepEqual(normalizeSubagentSettings({ stateful: { fleetView: "active" } }), {
+			stateful: { fleetView: "active" },
+		});
+		assert.deepEqual(normalizeSubagentSettings({ stateful: { lifecycleArtifacts: "metadata" } }), {
+			stateful: { lifecycleArtifacts: "metadata" },
+		});
+		assert.equal(normalizeSubagentSettings({ stateful: { fleetView: "always" } }), undefined);
+		assert.throws(() => updateFleetViewSetting("always" as "active"), /invalid fleetview/i);
+		assert.throws(
+			() => updateLifecycleArtifactSetting("full" as "metadata"),
+			/invalid lifecycle artifact/i,
+		);
+		assert.equal(
+			normalizeSubagentSettings({ stateful: { lifecycleArtifacts: "full" } }),
+			undefined,
+		);
+		assert.deepEqual(inspectFleetViewSettings(), {
+			path: configPath,
+			value: "off",
+			source: "default",
+		});
+		assert.deepEqual(inspectLifecycleArtifactSettings(), {
+			path: configPath,
+			value: "off",
+			source: "default",
+		});
+		writeFileSync(configPath, JSON.stringify({ future: { keep: true }, stateful: { future: 1 } }));
+		updateFleetViewSetting("active");
+		updateLifecycleArtifactSetting("metadata");
+		assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+			future: { keep: true },
+			stateful: { future: 1, fleetView: "active", lifecycleArtifacts: "metadata" },
+		});
+		assert.equal(inspectFleetViewSettings().source, "user settings");
+		assert.equal(inspectLifecycleArtifactSettings().source, "user settings");
 	});
 });
 

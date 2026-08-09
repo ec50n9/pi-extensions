@@ -5,6 +5,7 @@ import { getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-ag
 import { projectAgentRecords } from "./agent-projection.js";
 import { isThinkingLevel } from "./agents.js";
 import { redactPrivateText } from "./context.js";
+import type { EvidenceAttestation } from "./evidence.js";
 import type { ManagedAgent } from "./registry.js";
 import { resolveStatefulLimits } from "./stateful-limits.js";
 
@@ -125,7 +126,9 @@ function sanitizeAgent(agent: ManagedAgent): ManagedAgent {
 			...turn,
 			task: redactPrivateText(turn.task),
 			output: redactPrivateText(turn.output),
+			evidence: turn.evidence ? sanitizeEvidence(turn.evidence) : undefined,
 		})),
+		capabilityTools: agent.capabilityTools ? [...agent.capabilityTools] : undefined,
 	};
 }
 
@@ -149,6 +152,19 @@ function isStoredState(value: unknown): value is StoredState {
 			(record.parentId === undefined || typeof record.parentId === "string") &&
 			(record.thinkingLevel === undefined || isThinkingLevel(record.thinkingLevel)) &&
 			(record.workspaceMode === undefined || record.workspaceMode === "worktree") &&
+			(record.evidencePolicy === undefined || record.evidencePolicy === "attested") &&
+			(record.evidenceStatus === undefined ||
+				["attested", "missing", "invalid"].includes(record.evidenceStatus)) &&
+			(record.launchContractDigest === undefined ||
+				(typeof record.launchContractDigest === "string" &&
+					/^[a-f0-9]{24}$/u.test(record.launchContractDigest))) &&
+			(record.capabilityTools === undefined ||
+				(Array.isArray(record.capabilityTools) &&
+					record.capabilityTools.length <= 256 &&
+					record.capabilityTools.every(
+						(tool) => typeof tool === "string" && Buffer.byteLength(tool, "utf8") <= 256,
+					))) &&
+			(record.disableExtensions === undefined || typeof record.disableExtensions === "boolean") &&
 			(record.target === undefined || isTargetPolicyAudit(record.target)) &&
 			(record.children === undefined ||
 				(Array.isArray(record.children) &&
@@ -199,8 +215,43 @@ function isAgentTurn(value: unknown): boolean {
 		typeof turn.completedAt === "number" &&
 		Number.isFinite(turn.completedAt) &&
 		typeof turn.exitCode === "number" &&
-		Number.isFinite(turn.exitCode)
+		Number.isFinite(turn.exitCode) &&
+		(turn.evidence === undefined || isEvidence(turn.evidence))
 	);
+}
+
+function isEvidence(value: unknown): value is EvidenceAttestation {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+	const evidence = value as Record<string, unknown>;
+	if (!["attested", "missing", "invalid"].includes(String(evidence.status))) return false;
+	if (
+		evidence.summary !== undefined &&
+		(typeof evidence.summary !== "string" || Buffer.byteLength(evidence.summary, "utf8") > 2048)
+	) {
+		return false;
+	}
+	return ["changedFiles", "commandsRun", "validations", "residualRisks"].every((field) => {
+		const fieldValue = evidence[field];
+		return (
+			fieldValue === undefined ||
+			(Array.isArray(fieldValue) &&
+				fieldValue.length <= 32 &&
+				fieldValue.every(
+					(item) => typeof item === "string" && Buffer.byteLength(item, "utf8") <= 2048,
+				))
+		);
+	});
+}
+
+function sanitizeEvidence(evidence: EvidenceAttestation): EvidenceAttestation {
+	return {
+		...evidence,
+		summary: evidence.summary ? redactPrivateText(evidence.summary) : undefined,
+		changedFiles: evidence.changedFiles?.map(redactPrivateText),
+		commandsRun: evidence.commandsRun?.map(redactPrivateText),
+		validations: evidence.validations?.map(redactPrivateText),
+		residualRisks: evidence.residualRisks?.map(redactPrivateText),
+	};
 }
 
 function isMailboxMessage(value: unknown): boolean {

@@ -19,6 +19,7 @@ import {
 	type SubagentSettings,
 	THINKING_LEVELS,
 } from "./agents.js";
+import type { CapabilityCeilingRegistry } from "./capability-ceiling.js";
 import { resolveConsultTools } from "./consult-policy.js";
 import { renderConsultCall, renderConsultResult } from "./consult-render.js";
 import { resolveConsultResourceLaunchPolicy } from "./consult-resources.js";
@@ -26,8 +27,10 @@ import {
 	assertConsultationTargetAllowed,
 	type ResolvedSubagentTarget,
 	resolveSubagentTarget,
+	targetPolicyAudit,
 } from "./cwd-policy.js";
 import { assertSubagentDepthAllowed, resolveDefaultSubagentTimeoutMs } from "./execution.js";
+import { launchPolicyFromContract, resolveLaunchContract } from "./launch-contract.js";
 import {
 	DEFAULT_MAX_CONTEXT_BYTES,
 	DEFAULT_MAX_STDERR_BYTES,
@@ -88,6 +91,7 @@ export interface RegisterSubagentConsultOptions {
 	runChild?: (request: ConsultChildRequest) => Promise<SingleResult>;
 	invocationOverride?: { command: string; argsPrefix?: string[] };
 	resolveResourceLaunchPolicy?: typeof resolveConsultResourceLaunchPolicy;
+	ceilings?: CapabilityCeilingRegistry;
 }
 
 export interface ConsultProgressActivity {
@@ -150,6 +154,7 @@ export interface ConsultDetails {
 	cancelled?: boolean;
 	isError?: boolean;
 	truncated?: boolean;
+	launchContractDigest?: string;
 }
 
 const READ_ONLY_INSTRUCTION = [
@@ -440,7 +445,7 @@ async function resolveConsultSetup(
 ) {
 	const requestedResourcePolicy = settings?.consult?.resources ?? DEFAULT_CONSULT_RESOURCE_POLICY;
 	const resourcePolicy = target.trust.projectTrusted ? requestedResourcePolicy : "none";
-	const effectiveTools = resolveConsultTools(agent.tools);
+	const readOnlyTools = resolveConsultTools(agent.tools);
 	const projectTrusted = target.trust.projectTrusted;
 	const thinkingLevel = resolveSubagentThinkingLevel([agent], agent.name, operation.thinkingLevel);
 	const timeoutMs = operation.timeoutMs ?? agent.timeoutMs ?? resolveDefaultSubagentTimeoutMs();
@@ -452,7 +457,21 @@ async function resolveConsultSetup(
 	const resolveResources =
 		options.resolveResourceLaunchPolicy ?? resolveConsultResourceLaunchPolicy;
 	const launchPolicy = await resolveResources(resourcePolicy, projectTrusted, target.cwd);
-	launchPolicy.tools = effectiveTools;
+	const contract = resolveLaunchContract({
+		agent: { ...agent, tools: readOnlyTools },
+		agentScope: operation.agentScope,
+		target: targetPolicyAudit(target),
+		thinkingLevel,
+		timeoutMs,
+		transport: "subprocess",
+		disableExtensions: true,
+		disableSkills: launchPolicy.disableSkills,
+		disablePromptTemplates: launchPolicy.disablePromptTemplates,
+		disableContextFiles: launchPolicy.disableContextFiles,
+		ceiling: options.ceilings?.resolve() ?? { sources: [] },
+	});
+	const effectiveTools = contract.effectiveTools ?? readOnlyTools;
+	Object.assign(launchPolicy, launchPolicyFromContract(contract));
 	const childAgent: AgentConfig = {
 		...agent,
 		tools: effectiveTools,
@@ -473,6 +492,7 @@ async function resolveConsultSetup(
 		model: agent.model ? boundedPrivateText(agent.model, 256) : undefined,
 		thinkingLevel,
 		timeoutMs,
+		launchContractDigest: contract.digest,
 		policy: {
 			requestedTools:
 				agent.tools === undefined

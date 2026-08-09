@@ -7,12 +7,19 @@ import {
 	type SubagentSettings,
 	type SubagentThinkingLevel,
 } from "./agents.js";
+import type { CapabilityCeilingRegistry } from "./capability-ceiling.js";
 import {
 	assertDelegationTargetAllowed,
 	type ResolvedSubagentTarget,
 	resolveSubagentTarget,
 	targetPolicyAudit,
 } from "./cwd-policy.js";
+import {
+	appendEvidenceInstruction,
+	type EvidencePolicy,
+	parseEvidenceAttestation,
+} from "./evidence.js";
+import { launchPolicyFromContract, resolveLaunchContract } from "./launch-contract.js";
 import {
 	DEFAULT_MAX_CONTEXT_BYTES,
 	MAX_BLOCKING_PARALLEL_CONCURRENCY,
@@ -120,6 +127,7 @@ export async function executeSubagent(
 	onUpdate: AgentToolUpdateCallback<SubagentDetails> | undefined,
 	ctx: ExtensionContext,
 	settingsOverride?: SubagentSettings,
+	ceilings?: CapabilityCeilingRegistry,
 ): Promise<AgentToolResult<SubagentDetails> & { isError?: boolean }> {
 	assertSubagentDepthAllowed();
 	const agentScope: AgentScope = params.agentScope ?? "user";
@@ -191,13 +199,50 @@ export async function executeSubagent(
 	const chainTargets = params.chain?.map((step) => resolveTarget(step.cwd)) ?? [];
 	const parallelTargets = params.tasks?.map((task) => resolveTarget(task.cwd)) ?? [];
 	const aggregatorTarget = aggregator ? resolveTarget(aggregator.cwd) : undefined;
-	const attachTarget = (result: SingleResult, target: ResolvedSubagentTarget): SingleResult => {
+	const prepareLaunch = (
+		agentName: string,
+		target: ResolvedSubagentTarget,
+		thinkingLevel: SubagentThinkingLevel | undefined,
+		timeoutMs: number,
+		evidence: EvidencePolicy | undefined,
+	) => {
+		const agent = agents.find((candidate) => candidate.name === agentName);
+		const ceiling = ceilings?.resolve() ?? { sources: [] };
+		if (!agent) {
+			if (ceiling.allowedAgents && !ceiling.allowedAgents.includes(agentName)) {
+				throw new Error(`Subagent ${agentName} is denied by the active capability ceiling`);
+			}
+			return undefined;
+		}
+		return resolveLaunchContract({
+			agent,
+			agentScope,
+			target: targetPolicyAudit(target),
+			thinkingLevel,
+			timeoutMs,
+			transport: "subprocess",
+			evidence,
+			ceiling,
+		});
+	};
+	const attachLaunch = (
+		result: SingleResult,
+		target: ResolvedSubagentTarget,
+		originalTask: string,
+		evidence: EvidencePolicy | undefined,
+		contract: ReturnType<typeof prepareLaunch>,
+	): SingleResult => {
 		result.target = targetPolicyAudit(target);
+		result.task = originalTask;
+		result.evidence = parseEvidenceAttestation(getResultFinalOutput(result), evidence);
+		result.launchContractDigest = contract?.digest;
 		return result;
 	};
-	const launchPolicy = (target: ResolvedSubagentTarget) => ({
-		projectTrust: target.trust.projectTrusted,
-	});
+	const launchPolicy = (
+		contract: ReturnType<typeof prepareLaunch>,
+		target: ResolvedSubagentTarget,
+	) =>
+		contract ? launchPolicyFromContract(contract) : { projectTrust: target.trust.projectTrusted };
 
 	if (agentScope === "project" || agentScope === "both") {
 		const requestedAgentNames = new Set<string>();
@@ -268,23 +313,30 @@ export async function executeSubagent(
 					: undefined;
 
 				const target = chainTargets[i];
-				const result = attachTarget(
+				const thinkingLevel = resolveThinkingLevel(step.agent, step.thinkingLevel);
+				const timeoutMs = resolveTimeoutMs(step.agent, step.timeoutMs);
+				const evidence = step.evidence ?? params.evidence;
+				const contract = prepareLaunch(step.agent, target, thinkingLevel, timeoutMs, evidence);
+				const result = attachLaunch(
 					await runSingleAgent(
 						ctx.cwd,
 						agents,
 						step.agent,
-						taskWithContext,
+						appendEvidenceInstruction(taskWithContext, evidence),
 						target.cwd,
 						i + 1,
 						signal,
-						resolveThinkingLevel(step.agent, step.thinkingLevel),
-						resolveTimeoutMs(step.agent, step.timeoutMs),
+						thinkingLevel,
+						timeoutMs,
 						chainUpdate,
 						makeDetails("chain"),
 						undefined,
-						launchPolicy(target),
+						launchPolicy(contract, target),
 					),
 					target,
+					taskWithContext,
+					evidence,
+					contract,
 				);
 				results.push(result);
 
@@ -396,17 +448,21 @@ export async function executeSubagent(
 				MAX_BLOCKING_PARALLEL_CONCURRENCY,
 				async (t, index) => {
 					const target = parallelTargets[index];
-					const result = attachTarget(
+					const thinkingLevel = resolveThinkingLevel(t.agent, t.thinkingLevel);
+					const timeoutMs = resolveTimeoutMs(t.agent, t.timeoutMs);
+					const evidence = t.evidence ?? params.evidence;
+					const contract = prepareLaunch(t.agent, target, thinkingLevel, timeoutMs, evidence);
+					const result = attachLaunch(
 						await runSingleAgent(
 							ctx.cwd,
 							agents,
 							t.agent,
-							t.task,
+							appendEvidenceInstruction(t.task, evidence),
 							target.cwd,
 							undefined,
 							signal,
-							resolveThinkingLevel(t.agent, t.thinkingLevel),
-							resolveTimeoutMs(t.agent, t.timeoutMs),
+							thinkingLevel,
+							timeoutMs,
 							// Per-task update callback
 							(partial) => {
 								if (partial.details?.results[0]) {
@@ -416,9 +472,12 @@ export async function executeSubagent(
 							},
 							makeDetails("parallel"),
 							undefined,
-							launchPolicy(target),
+							launchPolicy(contract, target),
 						),
 						target,
+						t.task,
+						evidence,
+						contract,
 					);
 					allResults[index] = result;
 					doneCount += 1;
@@ -455,17 +514,27 @@ export async function executeSubagent(
 					DEFAULT_MAX_CONTEXT_BYTES,
 				).text;
 				const target = aggregatorTarget as ResolvedSubagentTarget;
-				aggregatorResult = attachTarget(
+				const thinkingLevel = resolveThinkingLevel(aggregator.agent, aggregator.thinkingLevel);
+				const timeoutMs = resolveTimeoutMs(aggregator.agent, aggregator.timeoutMs);
+				const evidence = aggregator.evidence ?? params.evidence;
+				const contract = prepareLaunch(
+					aggregator.agent,
+					target,
+					thinkingLevel,
+					timeoutMs,
+					evidence,
+				);
+				aggregatorResult = attachLaunch(
 					await runSingleAgent(
 						ctx.cwd,
 						agents,
 						aggregator.agent,
-						aggregatorTask,
+						appendEvidenceInstruction(aggregatorTask, evidence),
 						target.cwd,
 						undefined,
 						signal,
-						resolveThinkingLevel(aggregator.agent, aggregator.thinkingLevel),
-						resolveTimeoutMs(aggregator.agent, aggregator.timeoutMs),
+						thinkingLevel,
+						timeoutMs,
 						(partial) => {
 							status.update(fanInStatus(aggregator.agent));
 							if (onUpdate && partial.details?.results[0]) {
@@ -477,9 +546,12 @@ export async function executeSubagent(
 						},
 						makeDetails("parallel"),
 						undefined,
-						launchPolicy(target),
+						launchPolicy(contract, target),
 					),
 					target,
+					aggregatorTask,
+					evidence,
+					contract,
 				);
 			}
 
@@ -525,23 +597,35 @@ export async function executeSubagent(
 
 		try {
 			const target = singleTarget as ResolvedSubagentTarget;
-			const result = attachTarget(
+			const thinkingLevel = resolveThinkingLevel(params.agent, params.thinkingLevel);
+			const timeoutMs = resolveTimeoutMs(params.agent, params.timeoutMs);
+			const contract = prepareLaunch(
+				params.agent,
+				target,
+				thinkingLevel,
+				timeoutMs,
+				params.evidence,
+			);
+			const result = attachLaunch(
 				await runSingleAgent(
 					ctx.cwd,
 					agents,
 					params.agent,
-					params.task,
+					appendEvidenceInstruction(params.task, params.evidence),
 					target.cwd,
 					undefined,
 					signal,
-					resolveThinkingLevel(params.agent, params.thinkingLevel),
-					resolveTimeoutMs(params.agent, params.timeoutMs),
+					thinkingLevel,
+					timeoutMs,
 					onUpdate,
 					makeDetails("single"),
 					undefined,
-					launchPolicy(target),
+					launchPolicy(contract, target),
 				),
 				target,
+				params.task,
+				params.evidence,
+				contract,
 			);
 			const isError = isResultError(result);
 			if (isError) {

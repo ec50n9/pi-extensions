@@ -41,6 +41,9 @@ export type SubagentTransportKind = "subprocess" | "in-process";
 
 export type CompletionDelivery = "next-turn" | "auto-resume";
 
+export type FleetViewMode = "off" | "active";
+export type LifecycleArtifactsMode = "off" | "metadata";
+
 export const CONSULT_RESOURCE_POLICIES = ["project-context", "none", "all"] as const;
 
 export type ConsultResourcePolicy = (typeof CONSULT_RESOURCE_POLICIES)[number];
@@ -82,6 +85,8 @@ export interface SubagentRuntimeSettings {
 	idleTtlMs?: number;
 	retentionDays?: number;
 	maxStoredAgents?: number;
+	fleetView?: FleetViewMode;
+	lifecycleArtifacts?: LifecycleArtifactsMode;
 }
 
 export interface SubagentSettings {

@@ -7,6 +7,7 @@ import type { Message } from "@earendil-works/pi-ai";
 import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, AgentScope, AgentSource, SubagentThinkingLevel } from "./agents.js";
 import type { TargetPolicyAudit } from "./cwd-policy.js";
+import type { EvidenceAttestation } from "./evidence.js";
 import {
 	appendBounded,
 	DEFAULT_MAX_CONTEXT_BYTES,
@@ -89,6 +90,8 @@ export interface SingleResult {
 		overridden: string[];
 		unsupported: string[];
 	};
+	evidence?: EvidenceAttestation;
+	launchContractDigest?: string;
 }
 
 export interface SubagentDetails {

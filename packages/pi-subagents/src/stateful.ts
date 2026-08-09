@@ -15,31 +15,41 @@ import {
 	type SubagentSettings,
 	THINKING_LEVELS,
 } from "./agents.js";
+import type { CapabilityCeilingRegistry } from "./capability-ceiling.js";
+import { CompletionDeliveryBroker } from "./completion-delivery.js";
 import { buildContextSnapshot, type ContextMode, redactPrivateText } from "./context.js";
 import {
 	assertDelegationTargetAllowed,
 	resolveSubagentTarget,
 	targetPolicyAudit,
 } from "./cwd-policy.js";
-import { assertSubagentDepthAllowed } from "./execution.js";
+import type { EvidencePolicy } from "./evidence.js";
+import { assertSubagentDepthAllowed, resolveDefaultSubagentTimeoutMs } from "./execution.js";
+import { updateFleetWidget } from "./fleet-view.js";
 import {
 	type ChildSessionFactory,
 	InProcessTransport,
 	type ParentRuntimeSnapshot,
 } from "./in-process-transport.js";
+import { resolveLaunchContract } from "./launch-contract.js";
+import {
+	disabledLifecycleArtifactStatus,
+	type LifecycleArtifactStatus,
+	LifecycleArtifactWriter,
+} from "./lifecycle-artifacts.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, truncateUtf8 } from "./limits.js";
 import { AgentPersistence } from "./persistence.js";
 import {
 	AgentRegistry,
 	type AgentRunInspectionDetail,
 	type AgentRunInspectionSummary,
-	type AgentTurnCompletion,
 	type ManagedAgent,
 } from "./registry.js";
 import { DEFAULT_DELEGATION_CWD_POLICY, readSubagentSettings } from "./settings.js";
 import { createSpawnPromptGuidelines } from "./stateful-guidance.js";
 import { assertCurrentSpawn, disposeStatefulRuntime } from "./stateful-lifecycle.js";
 import { resolveStatefulLimits, type StatefulLimits } from "./stateful-limits.js";
+import { formatStatefulAgentLine, summarizeStatefulAgent } from "./stateful-presenter.js";
 import { createStatefulToolRenderer } from "./stateful-render.js";
 import {
 	assertFollowUpWriteAllowed,
@@ -75,10 +85,10 @@ const StatefulThinkingLevelSchema = StringEnum(THINKING_LEVELS, {
 	description:
 		"Optional requested Pi thinking level selected for this task difficulty; retained for every turn of the spawned agent.",
 });
+const EvidenceSchema = StringEnum(["attested"] as const, {
+	description: "Request bounded, unverified child evidence metadata for every turn.",
+});
 const MAX_TOOL_MESSAGE_BYTES = 2 * 1024;
-const MAX_COMPLETION_ERROR_BYTES = 512;
-const MAX_COMPLETIONS_PER_MESSAGE = 16;
-const COMPLETION_BATCH_DELAY_MS = 10;
 
 export interface StatefulSubagentDependencies {
 	blockingEnabled?: boolean;
@@ -86,6 +96,7 @@ export interface StatefulSubagentDependencies {
 	workspaceManager?: WorkspaceManager;
 	settings?: SubagentRuntimeSettings;
 	getSettings?: () => SubagentSettings | undefined;
+	ceilings?: CapabilityCeilingRegistry;
 }
 
 export interface StatefulSubagentRuntimeStatus {
@@ -104,9 +115,21 @@ export interface StatefulSubagentController {
 	setAgentCatalog(value: string): void;
 	refreshSettingsGuidance(): void;
 	getRuntimeStatus(): StatefulSubagentRuntimeStatus;
+	getFleetView(): "off" | "active";
+	getLifecycleArtifactStatus(): LifecycleArtifactStatus;
 	listAgents(includeClosed?: boolean): ManagedAgent[];
 	listRunInspection(includeClosed?: boolean): AgentRunInspectionSummary[];
 	getRunInspection(agentId: string): AgentRunInspectionDetail | undefined;
+	setFleetView(value: "off" | "active"): void;
+	followUp(
+		agentId: string,
+		task: string,
+		ctx: ExtensionContext,
+		signal?: AbortSignal,
+	): Promise<ManagedAgent>;
+	queueMessage(agentId: string, message: string): Promise<void>;
+	interruptAgent(agentId: string, subtree?: boolean): Promise<number>;
+	closeAgent(agentId: string, subtree?: boolean): Promise<number>;
 	clearAgents(): Promise<number>;
 }
 
@@ -126,12 +149,15 @@ export function registerStatefulSubagents(
 	const enabled = settings.enabled !== false;
 	const transportKind = resolveStatefulTransportKind(settings.transport);
 	let completionDelivery = resolveCompletionDelivery(settings.completionDelivery);
+	let fleetView = settings.fleetView ?? "off";
 	let runtimeLimits = resolveStatefulLimits(settings);
 	let agentCatalog = "";
 	let completionBroker: CompletionDeliveryBroker | undefined;
 	let refreshSpawnToolRegistration: (() => void) | undefined;
 	let registry: AgentRegistry | undefined;
 	let persistence: AgentPersistence | undefined;
+	let artifactWriter: LifecycleArtifactWriter | undefined;
+	let activeContext: ExtensionContext | undefined;
 	let sweepTimer: NodeJS.Timeout | undefined;
 	let runtimeGeneration = 0;
 	let runtimeTransition: Promise<void> = Promise.resolve();
@@ -143,6 +169,26 @@ export function registerStatefulSubagents(
 		dependencies.getSettings ? dependencies.getSettings() : readSubagentSettings();
 	const getCurrentStatefulSettings = () =>
 		dependencies.getSettings ? (dependencies.getSettings()?.stateful ?? {}) : settings;
+	const refreshFleet = (agents = registry?.list() ?? []) => {
+		if (activeContext) updateFleetWidget(activeContext, fleetView === "active", agents);
+	};
+	const clearFleetBestEffort = (ctx: Pick<ExtensionContext, "mode" | "ui"> | undefined) => {
+		if (!ctx) return;
+		try {
+			updateFleetWidget(ctx, false, []);
+		} catch {
+			// Widget cleanup must not block session replacement or shutdown.
+		}
+	};
+	const requireRegistry = () => {
+		if (!registry) throw new Error("Stateful subagents are not initialized for this session");
+		return registry;
+	};
+	const requireAgent = (agentId: string) => {
+		const agent = requireRegistry().get(agentId);
+		if (!agent) throw new Error(`Unknown subagent: ${agentId}`);
+		return agent;
+	};
 
 	const clearAgents = async (): Promise<number> => {
 		const generation = runtimeGeneration;
@@ -162,6 +208,101 @@ export function registerStatefulSubagents(
 		runtimeTransition = transition.catch(() => undefined);
 		await transition;
 		return count;
+	};
+	const followUp = async (
+		agentId: string,
+		task: string,
+		ctx: ExtensionContext,
+		signal?: AbortSignal,
+	): Promise<ManagedAgent> => {
+		const generation = runtimeGeneration;
+		const ownedRegistry = requireRegistry();
+		const currentSettings = getCurrentSettings();
+		const existing = ownedRegistry.get(agentId);
+		if (!existing) throw new Error(`Unknown subagent: ${agentId}`);
+		await confirmProjectAgent(
+			existing.agent,
+			existing.agentScope ?? "user",
+			false,
+			ctx,
+			existing.cwd,
+			currentSettings,
+		);
+		assertCurrentSpawn(signal, generation, runtimeGeneration);
+		assertFollowUpWriteAllowed(
+			ownedRegistry,
+			existing,
+			false,
+			isolatedAgents.has(existing.id),
+			currentSettings,
+		);
+		assertRetainedContractCompatible(existing, currentSettings);
+		return ownedRegistry.followUp(agentId, task);
+	};
+	const interruptAgent = async (agentId: string, subtree = false): Promise<number> => {
+		if (subtree) return (await requireRegistry().interruptTree(agentId)).length;
+		await requireRegistry().interrupt(agentId);
+		return 1;
+	};
+	const closeAgent = async (agentId: string, subtree = false): Promise<number> => {
+		const ownedRegistry = requireRegistry();
+		let count = 0;
+		try {
+			if (subtree) count = (await ownedRegistry.closeTree(agentId)).length;
+			else {
+				await ownedRegistry.close(agentId);
+				count = 1;
+			}
+		} finally {
+			await cleanupClosedWorkspaces(ownedRegistry, isolatedAgents, workspaceManager);
+		}
+		return count;
+	};
+	const assertRetainedContractCompatible = (
+		existing: ManagedAgent,
+		currentSettings: SubagentSettings | undefined,
+	) => {
+		const ceiling = dependencies.ceilings?.resolve() ?? { sources: [] };
+		if (ceiling.sources.length === 0) return;
+		const agent = discoverAgents(
+			existing.cwd,
+			existing.agentScope ?? "user",
+			currentSettings,
+		).agents.find((candidate) => candidate.name === existing.agent);
+		if (!agent) throw new Error(`Unknown subagent: ${existing.agent}`);
+		const target =
+			existing.target ??
+			targetPolicyAudit(
+				resolveSubagentTarget({
+					workspace: activeContext?.cwd ?? existing.cwd,
+					requestedCwd: existing.cwd,
+					currentProjectTrusted: activeContext?.isProjectTrusted() ?? false,
+				}),
+			);
+		const contract = resolveLaunchContract({
+			agent,
+			agentScope: existing.agentScope ?? "user",
+			target,
+			thinkingLevel: existing.thinkingLevel ?? agent.thinkingLevel,
+			timeoutMs: agent.timeoutMs ?? resolveDefaultSubagentTimeoutMs(),
+			transport: transportKind,
+			evidence: existing.evidencePolicy,
+			disableExtensions: transportKind === "in-process",
+			ceiling,
+		});
+		const previousTools = existing.capabilityTools ?? agent.tools;
+		const currentTools = contract.effectiveTools;
+		const toolsNarrowed =
+			previousTools === undefined
+				? currentTools !== undefined
+				: currentTools !== undefined && previousTools.some((tool) => !currentTools.includes(tool));
+		const previousDisableExtensions = existing.disableExtensions ?? contract.disableExtensions;
+		const extensionsNarrowed = contract.disableExtensions && !previousDisableExtensions;
+		if (toolsNarrowed || extensionsNarrowed) {
+			throw new Error(
+				"The active capability ceiling narrows this retained agent; create a new compliant agent",
+			);
+		}
 	};
 	const controller: StatefulSubagentController = {
 		getCompletionDelivery() {
@@ -190,6 +331,12 @@ export function registerStatefulSubagents(
 				...counts,
 			};
 		},
+		getFleetView() {
+			return fleetView;
+		},
+		getLifecycleArtifactStatus() {
+			return artifactWriter?.status() ?? disabledLifecycleArtifactStatus();
+		},
 		listAgents(includeClosed = false) {
 			return registry?.list(includeClosed) ?? [];
 		},
@@ -199,22 +346,40 @@ export function registerStatefulSubagents(
 		getRunInspection(agentId) {
 			return registry?.getInspection(agentId);
 		},
+		setFleetView(value) {
+			const previous = fleetView;
+			fleetView = value;
+			try {
+				refreshFleet();
+			} catch (error) {
+				fleetView = previous;
+				try {
+					refreshFleet();
+				} catch (rollbackError) {
+					throw new AggregateError(
+						[error, rollbackError],
+						"Failed to apply and roll back FleetView",
+					);
+				}
+				throw error;
+			}
+		},
+		followUp,
+		async queueMessage(agentId, message) {
+			await requireRegistry().sendMessage(agentId, message);
+		},
+		interruptAgent,
+		closeAgent,
 		clearAgents,
 	};
 	if (!enabled) return controller;
 
-	const requireRegistry = () => {
-		if (!registry) throw new Error("Stateful subagents are not initialized for this session");
-		return registry;
-	};
-	const requireAgent = (agentId: string) => {
-		const agent = requireRegistry().get(agentId);
-		if (!agent) throw new Error(`Unknown subagent: ${agentId}`);
-		return agent;
-	};
-
 	pi.on("session_start", async (_event, ctx) => {
 		const generation = ++runtimeGeneration;
+		clearFleetBestEffort(activeContext);
+		activeContext = ctx;
+		artifactWriter?.close();
+		artifactWriter = undefined;
 		completionBroker?.close();
 		completionBroker = undefined;
 		if (sweepTimer) clearInterval(sweepTimer);
@@ -245,6 +410,20 @@ export function registerStatefulSubagents(
 				retentionDays: sessionSettings.retentionDays,
 				maxStoredAgents: nextLimits.maxStoredAgents,
 			});
+			const sessionArtifactWriter =
+				sessionSettings.lifecycleArtifacts === "metadata"
+					? new LifecycleArtifactWriter(
+							owner,
+							sessionSettings.retentionDays,
+							undefined,
+							() => generation === runtimeGeneration,
+						)
+					: undefined;
+			await sessionArtifactWriter?.cleanupExpired();
+			if (generation !== runtimeGeneration) {
+				sessionArtifactWriter?.close();
+				return;
+			}
 			const sessionBroker = new CompletionDeliveryBroker(pi, ctx, completionDelivery, {
 				onDeliveryError: (error) => {
 					if (!ctx.hasUI) return;
@@ -258,12 +437,16 @@ export function registerStatefulSubagents(
 							modelRegistry: ctx.modelRegistry,
 							getParentRuntime: () => ({ ...parentRuntime }),
 							createSession: dependencies.createInProcessSession,
-							discoverAgent: (agent) =>
-								discoverAgents(
+							discoverAgent: (agent) => {
+								const candidate = discoverAgents(
 									agent.cwd,
 									agent.agentScope ?? "user",
 									getCurrentSettings(),
-								).agents.find((candidate) => candidate.name === agent.agent),
+								).agents.find((entry) => entry.name === agent.agent);
+								return candidate && agent.capabilityTools
+									? { ...candidate, tools: [...agent.capabilityTools] }
+									: candidate;
+							},
 						})
 					: new SubprocessTransport({ getSettings: getCurrentSettings });
 			const nextRegistry = new AgentRegistry(transport, {
@@ -277,6 +460,18 @@ export function registerStatefulSubagents(
 				onChange: async (agents) => {
 					await sessionPersistence.save(agents);
 					if (generation !== runtimeGeneration) return;
+					await sessionArtifactWriter?.publish(agents);
+					if (generation !== runtimeGeneration) return;
+					try {
+						refreshFleet(agents);
+					} catch (error) {
+						fleetView = "off";
+						clearFleetBestEffort(ctx);
+						if (ctx.hasUI) {
+							const reason = error instanceof Error ? error.message : String(error);
+							ctx.ui.notify(`Subagent FleetView was disabled: ${reason}`, "warning");
+						}
+					}
 					for (const agent of agents) {
 						for (const message of agent.mailbox) {
 							if (seenMessageIds.has(message.id)) continue;
@@ -319,14 +514,34 @@ export function registerStatefulSubagents(
 			nextRegistry.restore(restored);
 			if (generation !== runtimeGeneration) {
 				sessionBroker.close();
+				sessionArtifactWriter?.close();
+				await disposeStatefulRuntime(nextRegistry, workspaceManager);
+				return;
+			}
+			await sessionArtifactWriter?.publish(nextRegistry.list());
+			if (generation !== runtimeGeneration) {
+				sessionBroker.close();
+				sessionArtifactWriter?.close();
 				await disposeStatefulRuntime(nextRegistry, workspaceManager);
 				return;
 			}
 			registry = nextRegistry;
 			persistence = sessionPersistence;
+			artifactWriter = sessionArtifactWriter;
 			completionBroker = sessionBroker;
 			runtimeLimits = nextLimits;
+			fleetView = sessionSettings.fleetView ?? fleetView;
 			refreshSpawnToolRegistration?.();
+			try {
+				refreshFleet(nextRegistry.list());
+			} catch (error) {
+				fleetView = "off";
+				clearFleetBestEffort(ctx);
+				if (ctx.hasUI) {
+					const reason = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(`Subagent FleetView was disabled: ${reason}`, "warning");
+				}
+			}
 			const sweepEveryMs = Math.max(
 				1_000,
 				Math.min(sessionSettings.idleTtlMs ?? 60 * 60 * 1000, 60_000),
@@ -363,6 +578,10 @@ export function registerStatefulSubagents(
 
 	pi.on("session_shutdown", async (_event, ctx) => {
 		runtimeGeneration++;
+		clearFleetBestEffort(activeContext);
+		activeContext = undefined;
+		artifactWriter?.close();
+		artifactWriter = undefined;
 		completionBroker?.close();
 		completionBroker = undefined;
 		if (sweepTimer) clearInterval(sweepTimer);
@@ -395,6 +614,7 @@ export function registerStatefulSubagents(
 			agent: Type.String({ minLength: 1 }),
 			task: Type.String({ minLength: 1, maxLength: DEFAULT_MAX_CONTEXT_BYTES }),
 			thinkingLevel: Type.Optional(StatefulThinkingLevelSchema),
+			evidence: Type.Optional(EvidenceSchema),
 			cwd: Type.Optional(Type.String()),
 			agentScope: Type.Optional(ScopeSchema),
 			confirmProjectAgents: Type.Optional(Type.Boolean({ default: true })),
@@ -441,7 +661,8 @@ export function registerStatefulSubagents(
 			const resolvedAgent = discoverAgents(cwd, scope, currentSettings).agents.find(
 				(agent) => agent.name === params.agent,
 			);
-			if (params.workspaceMode === "worktree" && resolvedAgent?.source === "project") {
+			if (!resolvedAgent) throw new Error(`Unknown subagent: ${params.agent}`);
+			if (params.workspaceMode === "worktree" && resolvedAgent.source === "project") {
 				throw new Error("Project-local subagent definitions cannot run in a detached worktree");
 			}
 			const mode = resolveSpawnContextMode(params.context, params.contextEntryIds);
@@ -473,6 +694,17 @@ export function registerStatefulSubagents(
 				throw error;
 			}
 			const targetSnapshot = targetPolicyAudit(target);
+			const contract = resolveLaunchContract({
+				agent: resolvedAgent,
+				agentScope: scope,
+				target: targetSnapshot,
+				thinkingLevel: params.thinkingLevel ?? resolvedAgent.thinkingLevel,
+				timeoutMs: resolvedAgent.timeoutMs ?? resolveDefaultSubagentTimeoutMs(),
+				transport: transportKind,
+				evidence: params.evidence as EvidencePolicy | undefined,
+				disableExtensions: transportKind === "in-process",
+				ceiling: dependencies.ceilings?.resolve() ?? { sources: [] },
+			});
 			let agent: ManagedAgent | undefined;
 			try {
 				agent = await ownedRegistry.spawn({
@@ -487,6 +719,10 @@ export function registerStatefulSubagents(
 					contextTruncated: snapshot.truncated,
 					workspaceMode: workspace ? "worktree" : undefined,
 					target: targetSnapshot,
+					evidencePolicy: params.evidence as EvidencePolicy | undefined,
+					launchContractDigest: contract.digest,
+					capabilityTools: contract.effectiveTools,
+					disableExtensions: contract.disableExtensions,
 				});
 				assertCurrentSpawn(signal, generation, runtimeGeneration);
 			} catch (error) {
@@ -549,6 +785,7 @@ export function registerStatefulSubagents(
 				isolatedAgents.has(existing.id),
 				currentSettings,
 			);
+			assertRetainedContractCompatible(existing, currentSettings);
 			const agent = await ownedRegistry.followUp(params.agentId, params.task);
 			assertCurrentSpawn(signal, generation, runtimeGeneration);
 			return result(agent, `Started follow-up for ${agent.id}.`);
@@ -574,7 +811,7 @@ export function registerStatefulSubagents(
 							text: agents.length ? agents.map(formatLine).join("\n") : "No stateful subagents.",
 						},
 					],
-					details: { agents: agents.map(summarizeAgent) },
+					details: { agents: agents.map(summarizeStatefulAgent) },
 				};
 			}
 			const agentId = operation.agentId;
@@ -584,8 +821,8 @@ export function registerStatefulSubagents(
 					return {
 						content: [{ type: "text", text: `Interrupted ${agents.length} active agent(s).` }],
 						details: {
-							agent: summarizeAgent(requireAgent(agentId)),
-							agents: agents.map(summarizeAgent),
+							agent: summarizeStatefulAgent(requireAgent(agentId)),
+							agents: agents.map(summarizeStatefulAgent),
 						},
 					};
 				}
@@ -609,8 +846,8 @@ export function registerStatefulSubagents(
 				return {
 					content: [{ type: "text", text: `Closed ${agents.length} agent(s).` }],
 					details: {
-						agent: summarizeAgent(requireAgent(agentId)),
-						agents: agents.map(summarizeAgent),
+						agent: summarizeStatefulAgent(requireAgent(agentId)),
+						agents: agents.map(summarizeStatefulAgent),
 					},
 				};
 			}
@@ -684,276 +921,12 @@ export function resolveSpawnContextMode(
 	return normalizeContextMode(value);
 }
 
-export function formatStatefulAgentLine(agent: ManagedAgent): string {
-	const elapsedSeconds = Math.max(0, Math.floor((Date.now() - agent.updatedAt) / 1000));
-	const actions =
-		agent.state === "running" || agent.state === "starting"
-			? "interrupt, close"
-			: agent.state === "closed"
-				? "inspect"
-				: "send, close";
-	const task = agent.currentTask ? ` — ${sanitizeStatusLine(agent.currentTask, 80)}` : "";
-	const unread = agent.mailbox.filter((message) => !message.readAt).length;
-	const indent = "  ".repeat(agent.depth);
-	const thinking = agent.thinkingLevel ? ` thinking:${agent.thinkingLevel}` : "";
-	return `${indent}${sanitizeStatusLine(agent.id, 128)} ${sanitizeStatusLine(agent.agent, 128)} ${agent.state} ${elapsedSeconds}s${thinking} unread:${unread} [${actions}]${task}`;
-}
-
-function sanitizeStatusLine(value: string, maxLength: number): string {
-	return (
-		value
-			.slice(0, maxLength)
-			// biome-ignore lint/suspicious/noControlCharactersInRegex: Escape untrusted terminal controls.
-			.replace(/[\u0000-\u001f\u007f-\u009f]/gu, " ")
-			.replace(/\s+/gu, " ")
-			.trim()
-	);
-}
-
 function formatLine(agent: ManagedAgent): string {
 	return formatStatefulAgentLine(agent);
 }
 
-function summarizeAgent(agent: ManagedAgent) {
-	return {
-		id: agent.id,
-		agent: agent.agent,
-		parentId: agent.parentId,
-		rootId: agent.rootId,
-		depth: agent.depth,
-		children: [...agent.children],
-		state: agent.state,
-		createdAt: agent.createdAt,
-		updatedAt: agent.updatedAt,
-		cwd: agent.cwd,
-		workspaceMode: agent.workspaceMode ?? "shared",
-		thinkingLevel: agent.thinkingLevel,
-		currentTask: agent.currentTask
-			? truncateUtf8(agent.currentTask, MAX_TOOL_MESSAGE_BYTES).text
-			: undefined,
-		historyCount: agent.history.length,
-		unreadMessages: agent.mailbox.filter((message) => !message.readAt).length,
-		error: agent.error ? truncateUtf8(agent.error, MAX_TOOL_MESSAGE_BYTES).text : undefined,
-		target: agent.target,
-		policy: agent.policy,
-	};
-}
-
-interface CompletionMetadata {
-	agentId: string;
-	agent: string;
-	state: string;
-}
-
-interface CompletionMessage {
-	customType: "pi-subagent-completion";
-	content: string;
-	display: true;
-	details:
-		| CompletionMetadata
-		| {
-				completionCount: number;
-				completions: CompletionMetadata[];
-		  };
-}
-
-type CompletionContext = Pick<ExtensionContext, "hasPendingMessages" | "isIdle">;
-type CompletionPi = Pick<ExtensionAPI, "sendMessage">;
-
-export interface CompletionDeliveryBrokerOptions {
-	onDeliveryError?: (error: unknown) => void;
-}
-
-/**
- * Coalesces detached completions so one bounded notification batch starts at
- * most one root synthesis turn. The broker belongs to one parent session and
- * must be closed when that session is replaced or shut down.
- */
-export class CompletionDeliveryBroker {
-	private pending: AgentTurnCompletion[] = [];
-	private flushTimer?: NodeJS.Timeout;
-	private wakeInFlight = false;
-	private closed = false;
-
-	constructor(
-		private readonly pi: CompletionPi,
-		private readonly ctx: CompletionContext,
-		private delivery: CompletionDelivery,
-		private readonly options: CompletionDeliveryBrokerOptions = {},
-	) {}
-
-	enqueue(completion: AgentTurnCompletion): void {
-		if (this.closed) return;
-		this.pending.push(completion);
-		this.scheduleFlush();
-	}
-
-	setDelivery(value: CompletionDelivery): void {
-		this.delivery = value;
-		this.scheduleFlush();
-	}
-
-	onParentTurnStart(): void {
-		this.wakeInFlight = false;
-		this.scheduleFlush();
-	}
-
-	onParentSettled(): void {
-		this.wakeInFlight = false;
-		this.scheduleFlush();
-	}
-
-	flush(): void {
-		if (this.closed || this.pending.length === 0) return;
-		if (this.flushTimer) clearTimeout(this.flushTimer);
-		this.flushTimer = undefined;
-		if (this.delivery === "auto-resume" && !this.isRootIdle()) return;
-
-		const completions = this.pending.splice(0);
-		const batches = chunkCompletions(completions);
-		let canWake = this.shouldWakeRoot();
-		for (let index = 0; index < batches.length; index++) {
-			const triggerTurn = canWake && index === batches.length - 1;
-			const message = buildCompletionMessage(batches[index]);
-			if (triggerTurn) this.wakeInFlight = true;
-			try {
-				this.pi.sendMessage(message, { deliverAs: "steer", triggerTurn });
-			} catch (primaryError) {
-				if (triggerTurn) this.wakeInFlight = false;
-				canWake = false;
-				try {
-					this.pi.sendMessage(message, { deliverAs: "nextTurn", triggerTurn: false });
-				} catch (fallbackError) {
-					this.pending = [...batches.slice(index).flat(), ...this.pending];
-					try {
-						this.options.onDeliveryError?.(
-							new AggregateError(
-								[primaryError, fallbackError],
-								"Detached subagent completion delivery failed",
-							),
-						);
-					} catch {
-						// Delivery retention must survive a failing observer.
-					}
-					return;
-				}
-			}
-		}
-	}
-
-	close(): void {
-		this.closed = true;
-		if (this.flushTimer) clearTimeout(this.flushTimer);
-		this.flushTimer = undefined;
-		this.pending = [];
-	}
-
-	private scheduleFlush(): void {
-		if (this.closed || this.pending.length === 0 || this.flushTimer) return;
-		this.flushTimer = setTimeout(() => {
-			this.flushTimer = undefined;
-			this.flush();
-		}, COMPLETION_BATCH_DELAY_MS);
-	}
-
-	private isRootIdle(): boolean {
-		try {
-			return this.ctx.isIdle();
-		} catch {
-			return false;
-		}
-	}
-
-	private shouldWakeRoot(): boolean {
-		if (this.delivery !== "auto-resume" || this.wakeInFlight) return false;
-		try {
-			return !this.ctx.hasPendingMessages();
-		} catch {
-			return false;
-		}
-	}
-}
-
-function chunkCompletions(completions: AgentTurnCompletion[]): AgentTurnCompletion[][] {
-	const batches: AgentTurnCompletion[][] = [];
-	for (let index = 0; index < completions.length; index += MAX_COMPLETIONS_PER_MESSAGE) {
-		batches.push(completions.slice(index, index + MAX_COMPLETIONS_PER_MESSAGE));
-	}
-	return batches;
-}
-
-function buildCompletionMessage(completions: AgentTurnCompletion[]): CompletionMessage {
-	if (completions.length === 1) {
-		const completion = completions[0];
-		return {
-			customType: "pi-subagent-completion",
-			content: buildDetachedCompletionMessage(completion),
-			display: true,
-			details: completionMetadata(completion),
-		};
-	}
-	const content = truncateUtf8(
-		[
-			"Message Type: SUBAGENT_COMPLETION_BATCH",
-			`Completion Count: ${completions.length}`,
-			...completions.flatMap((completion, index) => [
-				"",
-				`--- Completion ${index + 1} of ${completions.length} ---`,
-				buildDetachedCompletionMessage(completion),
-			]),
-		].join("\n"),
-		DEFAULT_MAX_CONTEXT_BYTES,
-	).text;
-	return {
-		customType: "pi-subagent-completion",
-		content,
-		display: true,
-		details: {
-			completionCount: completions.length,
-			completions: completions.map(completionMetadata),
-		},
-	};
-}
-
-function completionMetadata(completion: AgentTurnCompletion): CompletionMetadata {
-	return {
-		agentId: completion.agent.id,
-		agent: completion.agent.agent,
-		state: completion.agent.state,
-	};
-}
-
-export function buildDetachedCompletionMessage(completion: AgentTurnCompletion): string {
-	const task = sanitizeCompletionLine(completion.task, 256) || "(unknown task)";
-	const agentName = sanitizeCompletionLine(completion.agent.agent, 128) || "(unknown agent)";
-	const output = redactPrivateText(completion.output);
-	const error = completion.error
-		? truncateUtf8(redactPrivateText(completion.error), MAX_COMPLETION_ERROR_BYTES).text
-		: "";
-	return truncateUtf8(
-		[
-			"Message Type: SUBAGENT_COMPLETION",
-			`Agent ID: ${completion.agent.id}`,
-			`Agent: ${agentName}`,
-			`Task: ${task}`,
-			`State: ${completion.agent.state}`,
-			...(error.trim() ? ["Error:", error] : []),
-			"Payload:",
-			output.trim() ? output : "(no output)",
-		].join("\n"),
-		MAX_TOOL_MESSAGE_BYTES,
-	).text;
-}
-
-function sanitizeCompletionLine(value: string, maxBytes: number): string {
-	return (
-		truncateUtf8(redactPrivateText(value), maxBytes)
-			// biome-ignore lint/suspicious/noControlCharactersInRegex: Strip untrusted terminal controls.
-			.text.replace(/[\u0000-\u001f\u007f]+/g, " ")
-			.replace(/\s+/g, " ")
-			.trim()
-	);
-}
+export { buildDetachedCompletionMessage, CompletionDeliveryBroker } from "./completion-delivery.js";
+export { formatStatefulAgentLine } from "./stateful-presenter.js";
 
 async function cleanupClosedWorkspaces(
 	registry: AgentRegistry,
@@ -974,7 +947,7 @@ function appendAgentCatalog(baseDescription: string, catalog: string): string {
 function result(agent: ManagedAgent, text: string) {
 	return {
 		content: [{ type: "text" as const, text }],
-		details: { agent: summarizeAgent(agent) },
+		details: { agent: summarizeStatefulAgent(agent) },
 	};
 }
 

@@ -54,6 +54,8 @@ export class SubprocessTransport implements SubagentTransport {
 				projectTrust:
 					record.target?.trust.projectTrusted ??
 					(record.agentScope === "project" || record.agentScope === "both"),
+				tools: record.capabilityTools ?? agent?.tools,
+				disableExtensions: record.disableExtensions,
 			},
 		);
 		return {

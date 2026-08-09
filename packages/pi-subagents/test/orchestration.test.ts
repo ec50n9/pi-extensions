@@ -574,6 +574,10 @@ test("stateful tools are available by default, disable cleanly, and expose the l
 		});
 		assert.deepEqual(disabledController.listAgents(), []);
 		assert.equal(await disabledController.clearAgents(), 0);
+		await assert.rejects(
+			() => disabledController.queueMessage("missing", "message"),
+			/not initialized/i,
+		);
 	} finally {
 		if (originalDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = originalDir;

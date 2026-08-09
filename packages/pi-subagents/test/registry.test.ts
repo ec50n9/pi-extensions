@@ -700,6 +700,11 @@ test("AgentPersistence atomically saves, restores, redacts, deletes, and quarant
 	await persistence.save([
 		record({
 			thinkingLevel: "high",
+			evidencePolicy: "attested",
+			evidenceStatus: "attested",
+			launchContractDigest: "a".repeat(24),
+			capabilityTools: ["read"],
+			disableExtensions: true,
 			target: {
 				cwd: process.cwd(),
 				boundary: "external",
@@ -722,6 +727,14 @@ test("AgentPersistence atomically saves, restores, redacts, deletes, and quarant
 					startedAt: 1,
 					completedAt: 2,
 					exitCode: 0,
+					evidence: {
+						status: "attested",
+						summary: "<private>evidence-secret</private>checked",
+						changedFiles: ["src/a.ts"],
+						commandsRun: [],
+						validations: ["ok"],
+						residualRisks: [],
+					},
 				},
 			],
 		}),
@@ -734,6 +747,9 @@ test("AgentPersistence atomically saves, restores, redacts, deletes, and quarant
 	assert.equal(restoredState?.thinkingLevel, "high");
 	assert.equal(restoredState?.target?.trust.kind, "saved-trusted");
 	assert.equal(restoredState?.target?.trust.projectTrusted, true);
+	assert.deepEqual(restoredState?.capabilityTools, ["read"]);
+	assert.equal(restoredState?.disableExtensions, true);
+	assert.equal(restoredState?.history[0]?.evidence?.summary, "[private content omitted]checked");
 	assert.equal(restoredState?.mailbox[0]?.content, "[private content omitted]visible");
 	const competing = new AgentPersistence("session", { stateDir: dir, maxStoredAgents: 2 });
 	await Promise.all([

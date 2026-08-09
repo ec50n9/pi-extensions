@@ -15,9 +15,15 @@
 	],
 	"files": [
 		"src",
+		"docs",
 		"README.md",
 		"LICENSE"
 	],
+	"exports": {
+		".": "./src/index.ts",
+		"./api": "./src/public-api.ts",
+		"./*": "./*"
+	},
 	"pi": {
 		"extensions": [
 			"./src/index.ts"

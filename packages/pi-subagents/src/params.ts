@@ -15,12 +15,18 @@ const ThinkingLevelSchema = StringEnum(THINKING_LEVELS, {
 		"Pi thinking level for the subagent process: off, minimal, low, medium, high, xhigh, or max.",
 });
 
+const EvidenceSchema = StringEnum(["attested"] as const, {
+	description:
+		"Ask the child to append bounded, unverified evidence metadata about files, commands, validation, and risks.",
+});
+
 const TaskItem = Type.Object({
 	agent: Type.String({ description: "Name of the agent to invoke" }),
 	task: Type.String({ description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	timeoutMs: Type.Optional(TimeoutMs),
 	thinkingLevel: Type.Optional(ThinkingLevelSchema),
+	evidence: Type.Optional(EvidenceSchema),
 });
 
 const ChainItem = Type.Object({
@@ -29,6 +35,7 @@ const ChainItem = Type.Object({
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 	timeoutMs: Type.Optional(TimeoutMs),
 	thinkingLevel: Type.Optional(ThinkingLevelSchema),
+	evidence: Type.Optional(EvidenceSchema),
 });
 
 const AggregatorItem = Type.Object(
@@ -44,6 +51,7 @@ const AggregatorItem = Type.Object(
 		),
 		timeoutMs: Type.Optional(TimeoutMs),
 		thinkingLevel: Type.Optional(ThinkingLevelSchema),
+		evidence: Type.Optional(EvidenceSchema),
 	},
 	{
 		description:
@@ -84,6 +92,7 @@ export const SubagentParams = Type.Object({
 	),
 	timeoutMs: Type.Optional(TimeoutMs),
 	thinkingLevel: Type.Optional(ThinkingLevelSchema),
+	evidence: Type.Optional(EvidenceSchema),
 });
 
 export type SubagentParams = Static<typeof SubagentParams>;

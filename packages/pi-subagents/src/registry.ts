@@ -2,6 +2,12 @@ import { randomUUID } from "node:crypto";
 import { projectAgentRecords } from "./agent-projection.js";
 import type { SubagentThinkingLevel } from "./agents.js";
 import type { TargetPolicyAudit } from "./cwd-policy.js";
+import {
+	appendEvidenceInstruction,
+	type EvidenceAttestation,
+	type EvidencePolicy,
+	parseEvidenceAttestation,
+} from "./evidence.js";
 import { DEFAULT_MAX_CONTEXT_BYTES, DEFAULT_MAX_OUTPUT_BYTES, truncateUtf8 } from "./limits.js";
 import { resolveStatefulLimits } from "./stateful-limits.js";
 import { type AgentTurnRunner, normalizeTransport, type SubagentTransport } from "./transport.js";
@@ -24,6 +30,7 @@ export interface AgentTurn {
 	completedAt: number;
 	exitCode: number;
 	truncated?: boolean;
+	evidence?: EvidenceAttestation;
 }
 
 export interface AgentMailboxMessage {
@@ -60,6 +67,11 @@ export interface ManagedAgent {
 	policy?: { inherited: string[]; overridden: string[]; unsupported: string[] };
 	mailbox: AgentMailboxMessage[];
 	currentMailboxMessageIds?: string[];
+	evidencePolicy?: EvidencePolicy;
+	evidenceStatus?: EvidenceAttestation["status"];
+	launchContractDigest?: string;
+	capabilityTools?: string[];
+	disableExtensions?: boolean;
 }
 
 export interface AgentRunInspectionSummary {
@@ -70,6 +82,7 @@ export interface AgentRunInspectionSummary {
 	updatedAt: number;
 	historyCount: number;
 	unreadMessages: number;
+	evidenceStatus?: EvidenceAttestation["status"];
 }
 
 export interface AgentRunInspectionDetail extends AgentRunInspectionSummary {
@@ -80,6 +93,9 @@ export interface AgentRunInspectionDetail extends AgentRunInspectionSummary {
 	workspaceMode?: "worktree";
 	target?: TargetPolicyAudit;
 	policy?: { inherited: string[]; overridden: string[]; unsupported: string[] };
+	launchContractDigest?: string;
+	capabilityTools?: string[];
+	disableExtensions?: boolean;
 }
 
 export interface AgentInspectionCounts {
@@ -94,6 +110,7 @@ export interface TurnOutcome {
 	truncated?: boolean;
 	error?: string;
 	policy?: ManagedAgent["policy"];
+	evidence?: EvidenceAttestation;
 }
 
 export interface AgentTurnCompletion {
@@ -241,7 +258,10 @@ export class AgentRegistry {
 				mailbox: (record.mailbox ?? [])
 					.slice(-this.maxMailboxMessages)
 					.map((message) => ({ ...message, recipientId: record.id })),
-				history: record.history.slice(-this.maxHistoryTurns).map((turn) => ({ ...turn })),
+				history: record.history.slice(-this.maxHistoryTurns).map((turn) => ({
+					...turn,
+					evidence: turn.evidence ? copyEvidence(turn.evidence) : undefined,
+				})),
 			});
 		}
 		for (const agent of this.agents.values()) {
@@ -263,6 +283,10 @@ export class AgentRegistry {
 		contextTruncated?: boolean;
 		workspaceMode?: "worktree";
 		target?: TargetPolicyAudit;
+		evidencePolicy?: EvidencePolicy;
+		launchContractDigest?: string;
+		capabilityTools?: string[];
+		disableExtensions?: boolean;
 	}): Promise<ManagedAgent> {
 		if (!input.task.trim()) throw new Error("Subagent tasks cannot be empty");
 		const task = truncateUtf8(input.task, this.maxTaskBytes).text;
@@ -308,6 +332,10 @@ export class AgentRegistry {
 			contextTruncated: input.contextTruncated,
 			workspaceMode: input.workspaceMode,
 			target: input.target,
+			evidencePolicy: input.evidencePolicy,
+			launchContractDigest: input.launchContractDigest,
+			capabilityTools: input.capabilityTools ? [...input.capabilityTools] : undefined,
+			disableExtensions: input.disableExtensions,
 		};
 		this.agents.set(record.id, record);
 		if (parent) {
@@ -580,6 +608,9 @@ export class AgentRegistry {
 						unsupported: [...agent.policy.unsupported],
 					}
 				: undefined,
+			launchContractDigest: agent.launchContractDigest,
+			capabilityTools: agent.capabilityTools ? [...agent.capabilityTools] : undefined,
+			disableExtensions: agent.disableExtensions,
 		};
 	}
 
@@ -647,7 +678,11 @@ export class AgentRegistry {
 		let completionOutput = "";
 		let completionError: string | undefined;
 		void this.transport
-			.runTurn(this.copy(agent), task, controller.signal)
+			.runTurn(
+				this.copy(agent),
+				appendEvidenceInstruction(task, agent.evidencePolicy),
+				controller.signal,
+			)
 			.then(async (outcome) => {
 				const output = truncateUtf8(outcome.output, this.maxTurnOutputBytes).text;
 				const error = outcome.error
@@ -669,6 +704,10 @@ export class AgentRegistry {
 						: "failed";
 				agent.error = error;
 				agent.policy = outcome.policy;
+				const evidence = outcome.evidence ?? parseEvidenceAttestation(output, agent.evidencePolicy);
+				agent.evidenceStatus = evidence?.status;
+				const latestTurn = agent.history.at(-1);
+				if (latestTurn && evidence) latestTurn.evidence = evidence;
 				completionOutput = output;
 				completionError = error;
 				completionContent = output || error || `${agent.id} ${agent.state}`;
@@ -851,6 +890,7 @@ export class AgentRegistry {
 			updatedAt: agent.updatedAt,
 			historyCount: agent.history.length,
 			unreadMessages,
+			...(agent.evidenceStatus ? { evidenceStatus: agent.evidenceStatus } : {}),
 		};
 	}
 
@@ -862,8 +902,12 @@ export class AgentRegistry {
 			currentMailboxMessageIds: agent.currentMailboxMessageIds
 				? [...agent.currentMailboxMessageIds]
 				: undefined,
-			history: agent.history.map((turn) => ({ ...turn })),
+			history: agent.history.map((turn) => ({
+				...turn,
+				evidence: turn.evidence ? copyEvidence(turn.evidence) : undefined,
+			})),
 			mailbox: agent.mailbox.map((message) => ({ ...message })),
+			capabilityTools: agent.capabilityTools ? [...agent.capabilityTools] : undefined,
 			target: agent.target ? { ...agent.target, trust: { ...agent.target.trust } } : undefined,
 			policy: agent.policy
 				? {
@@ -874,4 +918,14 @@ export class AgentRegistry {
 				: undefined,
 		};
 	}
+}
+
+function copyEvidence(evidence: EvidenceAttestation): EvidenceAttestation {
+	return {
+		...evidence,
+		changedFiles: evidence.changedFiles ? [...evidence.changedFiles] : undefined,
+		commandsRun: evidence.commandsRun ? [...evidence.commandsRun] : undefined,
+		validations: evidence.validations ? [...evidence.validations] : undefined,
+		residualRisks: evidence.residualRisks ? [...evidence.residualRisks] : undefined,
+	};
 }

@@ -35,6 +35,7 @@ import {
 } from "../src/agents.js";
 import { registerSubagentConfigCommand, type SubagentSettingsRuntime } from "../src/config-ui.js";
 import { hasUsableAggregator } from "../src/params.js";
+import { PI_SUBAGENTS_V1_REPLY, PI_SUBAGENTS_V1_REQUEST } from "../src/public-api.js";
 import type { ManagedAgent } from "../src/registry.js";
 import { consumeSubagentSettingsNotice } from "../src/settings.js";
 import { applyStatefulLimitSetting } from "../src/stateful-limit-ui.js";
@@ -253,6 +254,46 @@ test("blocking parallel calls honor the configured worker limit", async () => {
 		);
 		assert.equal(raisedResult.details?.results.length, 9);
 		assert.doesNotMatch(raisedResult.content?.[0]?.text ?? "", /too many parallel tasks/i);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("public preflight returns a side-effect-free launch contract without adding tools", async () => {
+	const directory = mkdtempSync(path.join(os.tmpdir(), "pi-subagents-preflight-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = directory;
+	try {
+		const mock = createMockPi();
+		subagents(mock.pi);
+		const context = createMockContext({ cwd: directory });
+		const replies: unknown[] = [];
+		mock.eventBus.on(PI_SUBAGENTS_V1_REPLY, (reply) => replies.push(reply));
+		for (const handler of mock.events.get("session_start") ?? []) {
+			await handler({}, context.ctx);
+		}
+		const registrationsBeforePreflight = mock.tools.length;
+		mock.eventBus.emit(PI_SUBAGENTS_V1_REQUEST, {
+			requestId: "preflight-1",
+			method: "preflight",
+			payload: { agent: "scout" },
+		});
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(mock.tools.length, registrationsBeforePreflight);
+		assert.equal(new Set(mock.tools.map((tool) => tool.name)).size, 7);
+		assert.equal(mock.sentMessages.length, 0);
+		assert.equal(replies.length, 1);
+		const reply = replies[0] as {
+			ok: boolean;
+			result: { agent: string; transport: string; effectiveTools: string[]; digest: string };
+		};
+		assert.equal(reply.ok, true);
+		assert.equal(reply.result.agent, "scout");
+		assert.equal(reply.result.transport, "subprocess");
+		assert.deepEqual(reply.result.effectiveTools, ["read", "grep", "find", "ls", "bash"]);
+		assert.match(reply.result.digest, /^[a-f0-9]{24}$/u);
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
@@ -1763,6 +1804,91 @@ test("subagent settings UI preserves unknown JSON and applies completion deliver
 		});
 		await command.handler("settings", nonTui.ctx);
 		assert.match(nonTui.notifications[0]?.message ?? "", /Edit settings manually/);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("subagent settings UI applies FleetView now and lifecycle metadata after reload", async () => {
+	const directory = mkdtempSync(path.join(os.tmpdir(), "pi-subagents-additive-settings-ui-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = directory;
+	try {
+		const mock = createMockPi();
+		subagents(mock.pi);
+		const command = mock.commands.get("subagents");
+		assert.ok(command);
+		let call = 0;
+		const context = createMockContext({
+			mode: "tui",
+			hasUI: true,
+			custom: async (factory: unknown) => {
+				const down = call++ === 0 ? 4 : 5;
+				return driveCustomSelector(factory, [
+					...Array.from({ length: down }, () => "\u001b[B"),
+					"\r",
+					"\u001b",
+				]).result;
+			},
+		});
+		await command.handler("settings", context.ctx);
+		await command.handler("settings", context.ctx);
+		assert.deepEqual(JSON.parse(readFileSync(path.join(directory, "pi-subagents.json"), "utf8")), {
+			stateful: { fleetView: "active", lifecycleArtifacts: "metadata" },
+		});
+		assert.match(
+			context.notifications.map((entry) => entry.message).join("\n"),
+			/FleetView.*applied|Show active agents/i,
+		);
+		assert.match(
+			context.notifications.map((entry) => entry.message).join("\n"),
+			/Metadata after reload.*reload/i,
+		);
+	} finally {
+		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+		rmSync(directory, { recursive: true, force: true });
+	}
+});
+
+test("FleetView runtime failure leaves settings and effective state unchanged", async () => {
+	const directory = mkdtempSync(path.join(os.tmpdir(), "pi-subagents-fleet-rollback-"));
+	const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+	process.env.PI_CODING_AGENT_DIR = directory;
+	try {
+		const settingsPath = path.join(directory, "pi-subagents.json");
+		writeFileSync(settingsPath, "{}\n");
+		const mock = createMockPi();
+		subagents(mock.pi);
+		const command = mock.commands.get("subagents");
+		assert.ok(command);
+		const context = createMockContext({
+			mode: "tui",
+			hasUI: true,
+			custom: async (factory: unknown) =>
+				driveCustomSelector(factory, [
+					"\u001b[B",
+					"\u001b[B",
+					"\u001b[B",
+					"\u001b[B",
+					"\r",
+					"\u001b",
+				]).result,
+		});
+		for (const handler of mock.events.get("session_start") ?? []) {
+			await handler({}, context.ctx);
+		}
+		(context.ctx as { ui: { setWidget: () => void } }).ui.setWidget = () => {
+			throw new Error("widget failed");
+		};
+		await command.handler("settings", context.ctx);
+		assert.equal(readFileSync(settingsPath, "utf8"), "{}\n");
+		assert.match(context.notifications.at(-1)?.message ?? "", /not applied.*roll back fleetview/i);
+		for (const handler of mock.events.get("session_shutdown") ?? []) {
+			await handler({}, context.ctx);
+		}
 	} finally {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;

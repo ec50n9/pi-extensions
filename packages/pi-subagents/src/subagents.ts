@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 /**
  * Subagent Tool - Delegate tasks to specialized agents
  *
@@ -15,22 +17,40 @@
 import {
 	CONFIG_DIR_NAME,
 	type ExtensionAPI,
+	type ExtensionContext,
 	type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import {
+	type AgentScope,
 	type ConsultationCwdPolicy,
 	type ConsultResourcePolicy,
 	type DelegationCwdPolicy,
 	discoverAgentCatalog,
+	discoverAgents,
 	formatAgentCatalog,
+	isThinkingLevel,
 	type SubagentSettings,
+	type SubagentThinkingLevel,
 } from "./agents.js";
+import { CapabilityCeilingRegistry } from "./capability-ceiling.js";
 import { registerSubagentConfigCommand, registerSubagentConfigLifecycle } from "./config-ui.js";
 import { registerSubagentConsult } from "./consult.js";
-import { executeSubagent } from "./execution.js";
+import {
+	assertDelegationTargetAllowed,
+	resolveSubagentTarget,
+	targetPolicyAudit,
+} from "./cwd-policy.js";
+import type { EvidencePolicy } from "./evidence.js";
+import { executeSubagent, resolveDefaultSubagentTimeoutMs } from "./execution.js";
 import { registerSubagentInspect } from "./inspect.js";
-import { MAX_BLOCKING_PARALLEL_CONCURRENCY } from "./limits.js";
+import { resolveLaunchContract } from "./launch-contract.js";
+import {
+	DEFAULT_MAX_CONTEXT_BYTES,
+	MAX_BLOCKING_PARALLEL_CONCURRENCY,
+	MAX_SUBAGENT_TIMEOUT_MS,
+} from "./limits.js";
 import { SubagentParams } from "./params.js";
+import { registerPiSubagentsV1Api } from "./public-api.js";
 import { renderSubagentCall, renderSubagentResult } from "./render.js";
 import type { SubagentDetails } from "./runner.js";
 import {
@@ -41,17 +61,19 @@ import {
 	inspectSubagentSettings,
 	readSubagentSettings,
 	resolveBlockingMaxParallelTasks,
+	resolveSubagentThinkingLevel,
 } from "./settings.js";
 import { registerStatefulSubagents } from "./stateful.js";
 
 export default function (pi: ExtensionAPI) {
 	const configOwner = registerSubagentConfigLifecycle(pi);
+	const ceilings = new CapabilityCeilingRegistry();
 	const settings = readSubagentSettings();
 	let currentSettings: SubagentSettings | undefined = settings;
 	let currentCatalog = "";
 	const blockingEnabled = settings?.blocking?.enabled !== false;
 	const refreshBlockingCatalog = blockingEnabled
-		? registerBlockingSubagent(pi, () => currentSettings)
+		? registerBlockingSubagent(pi, () => currentSettings, ceilings)
 		: () => undefined;
 	let refreshStatefulCatalog: (catalog: string) => void = () => undefined;
 	let refreshConsultCatalog: (catalog: string) => void = () => undefined;
@@ -80,8 +102,51 @@ export default function (pi: ExtensionAPI) {
 		blockingEnabled,
 		settings: settings?.stateful,
 		getSettings: () => currentSettings,
+		ceilings,
 	});
 	refreshStatefulCatalog = statefulRuntime.setAgentCatalog;
+	registerPiSubagentsV1Api(pi, ceilings, {
+		preflight: (payload, ctx) => ({
+			...preflightPublicDelegation(payload, ctx, currentSettings, ceilings),
+			lifecycleArtifact: statefulRuntime.getLifecycleArtifactStatus(),
+		}),
+		delegate: async (payload, signal, ctx) => {
+			const request = parsePublicDelegation(payload, true);
+			const requestedAgent = discoverAgents(
+				ctx.cwd,
+				request.agentScope,
+				currentSettings,
+			).agents.find((agent) => agent.name === request.agent);
+			if (requestedAgent?.source === "project" && request.confirmProjectAgents && !ctx.hasUI) {
+				throw new Error(
+					"Project-local subagent confirmation requires UI; set confirmProjectAgents to false explicitly only in a trusted project",
+				);
+			}
+			return executeSubagent(
+				`public:${randomUUID()}`,
+				{
+					agent: request.agent,
+					task: request.task,
+					cwd: request.cwd,
+					agentScope: request.agentScope,
+					thinkingLevel: request.thinkingLevel,
+					timeoutMs: request.timeoutMs,
+					evidence: request.evidence,
+					confirmProjectAgents: request.confirmProjectAgents,
+				},
+				signal,
+				undefined,
+				ctx,
+				currentSettings,
+				ceilings,
+			);
+		},
+		status: () => ({
+			...statefulRuntime.getRuntimeStatus(),
+			fleetView: statefulRuntime.getFleetView(),
+			lifecycleArtifact: statefulRuntime.getLifecycleArtifactStatus(),
+		}),
+	});
 	const getBlockingEnabled = () => blockingEnabled;
 	const getMaxParallelTasks = () => resolveBlockingMaxParallelTasks(currentSettings);
 	const getConsultResourcePolicy = () =>
@@ -101,6 +166,7 @@ export default function (pi: ExtensionAPI) {
 	if (blockingEnabled) {
 		refreshConsultCatalog = registerSubagentConsult(pi, {
 			getSettings: () => currentSettings,
+			ceilings,
 		});
 	}
 	registerSubagentConfigCommand(
@@ -160,9 +226,152 @@ export default function (pi: ExtensionAPI) {
 	);
 }
 
+interface PublicLeafDelegation {
+	agent: string;
+	task: string;
+	cwd?: string;
+	agentScope: AgentScope;
+	thinkingLevel?: SubagentThinkingLevel;
+	timeoutMs?: number;
+	evidence?: EvidencePolicy;
+	confirmProjectAgents: boolean;
+}
+
+function parsePublicDelegation(payload: unknown, requireTask: boolean): PublicLeafDelegation {
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+		throw new Error("Delegation payload must be an object");
+	}
+	const value = payload as Record<string, unknown>;
+	const allowed = new Set([
+		"agent",
+		"task",
+		"cwd",
+		"agentScope",
+		"thinkingLevel",
+		"timeoutMs",
+		"evidence",
+		"confirmProjectAgents",
+	]);
+	if (Object.keys(value).some((key) => !allowed.has(key))) {
+		throw new Error("Delegation payload contains an unsupported field");
+	}
+	if (
+		typeof value.agent !== "string" ||
+		!value.agent.trim() ||
+		value.agent.length > 256 ||
+		value.agent.includes("\0")
+	) {
+		throw new Error("agent must be a non-empty bounded string");
+	}
+	if (
+		requireTask &&
+		(typeof value.task !== "string" ||
+			!value.task.trim() ||
+			Buffer.byteLength(value.task, "utf8") > DEFAULT_MAX_CONTEXT_BYTES)
+	) {
+		throw new Error("task must be a non-empty bounded string");
+	}
+	if (!requireTask && value.task !== undefined) {
+		throw new Error("preflight does not accept task");
+	}
+	if (value.task !== undefined && typeof value.task !== "string") {
+		throw new Error("task must be a string");
+	}
+	if (typeof value.task === "string" && value.task.includes("\0")) {
+		throw new Error("task must not contain NUL bytes");
+	}
+	if (
+		value.cwd !== undefined &&
+		(typeof value.cwd !== "string" ||
+			!value.cwd.trim() ||
+			value.cwd.length > 4096 ||
+			value.cwd.includes("\0"))
+	) {
+		throw new Error("cwd must be a non-empty bounded string");
+	}
+	const scope = value.agentScope ?? "user";
+	if (scope !== "user" && scope !== "project" && scope !== "both") {
+		throw new Error("agentScope must be user, project, or both");
+	}
+	if (value.thinkingLevel !== undefined && !isThinkingLevel(value.thinkingLevel)) {
+		throw new Error("thinkingLevel is invalid");
+	}
+	if (
+		value.timeoutMs !== undefined &&
+		(typeof value.timeoutMs !== "number" ||
+			!Number.isFinite(value.timeoutMs) ||
+			value.timeoutMs < 1 ||
+			value.timeoutMs > MAX_SUBAGENT_TIMEOUT_MS)
+	) {
+		throw new Error("timeoutMs is outside the supported range");
+	}
+	if (value.evidence !== undefined && value.evidence !== "attested") {
+		throw new Error("evidence must be attested when provided");
+	}
+	if (value.confirmProjectAgents !== undefined && typeof value.confirmProjectAgents !== "boolean") {
+		throw new Error("confirmProjectAgents must be boolean");
+	}
+	return {
+		agent: value.agent,
+		task: typeof value.task === "string" ? value.task : "",
+		cwd: value.cwd as string | undefined,
+		agentScope: scope,
+		thinkingLevel: value.thinkingLevel as SubagentThinkingLevel | undefined,
+		timeoutMs: value.timeoutMs as number | undefined,
+		evidence: value.evidence as EvidencePolicy | undefined,
+		confirmProjectAgents: value.confirmProjectAgents !== false,
+	};
+}
+
+function preflightPublicDelegation(
+	payload: unknown,
+	ctx: ExtensionContext,
+	settings: SubagentSettings | undefined,
+	ceilings: CapabilityCeilingRegistry,
+) {
+	const request = parsePublicDelegation(payload, false);
+	if (
+		(request.agentScope === "project" || request.agentScope === "both") &&
+		!ctx.isProjectTrusted()
+	) {
+		throw new Error("Project-local subagent definitions require a trusted project");
+	}
+	const discovery = discoverAgents(ctx.cwd, request.agentScope, settings);
+	const agent = discovery.agents.find((candidate) => candidate.name === request.agent);
+	if (!agent) throw new Error(`Unknown agent: ${request.agent}`);
+	const target = resolveSubagentTarget({
+		workspace: ctx.cwd,
+		requestedCwd: request.cwd,
+		currentProjectTrusted: ctx.isProjectTrusted(),
+	});
+	assertDelegationTargetAllowed(
+		target,
+		settings?.cwdPolicy?.delegation ?? DEFAULT_DELEGATION_CWD_POLICY,
+	);
+	const contract = resolveLaunchContract({
+		agent,
+		agentScope: request.agentScope,
+		target: targetPolicyAudit(target),
+		thinkingLevel: resolveSubagentThinkingLevel(
+			discovery.agents,
+			request.agent,
+			request.thinkingLevel,
+		),
+		timeoutMs: request.timeoutMs ?? agent.timeoutMs ?? resolveDefaultSubagentTimeoutMs(),
+		transport: "subprocess",
+		evidence: request.evidence,
+		ceiling: ceilings.resolve(),
+	});
+	return {
+		...contract,
+		projectAgentConfirmationRequired: agent.source === "project" && request.confirmProjectAgents,
+	};
+}
+
 function registerBlockingSubagent(
 	pi: ExtensionAPI,
 	getSettings: () => SubagentSettings | undefined,
+	ceilings: CapabilityCeilingRegistry,
 ): (catalog: string) => void {
 	let catalog = "";
 	const baseDescription = () =>
@@ -196,7 +405,7 @@ function registerBlockingSubagent(
 		parameters: SubagentParams,
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			return executeSubagent(toolCallId, params, signal, onUpdate, ctx, getSettings());
+			return executeSubagent(toolCallId, params, signal, onUpdate, ctx, getSettings(), ceilings);
 		},
 
 		renderCall(args, theme) {
@@ -237,6 +446,8 @@ export {
 	inspectConsultResourceSettings,
 	inspectCwdPolicySettings,
 	inspectDelegationWorkflowSettings,
+	inspectFleetViewSettings,
+	inspectLifecycleArtifactSettings,
 	inspectStatefulLimitSettings,
 	inspectSubagentSettings,
 	normalizeAgentSettings,
@@ -254,5 +465,7 @@ export {
 	updateConsultResourceSetting,
 	updateCwdPolicySetting,
 	updateDelegationWorkflowSetting,
+	updateFleetViewSetting,
+	updateLifecycleArtifactSetting,
 	updateStatefulLimitSetting,
 } from "./settings.js";

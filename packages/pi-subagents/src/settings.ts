@@ -12,7 +12,9 @@ import {
 	type ConsultResourcePolicy,
 	DELEGATION_CWD_POLICIES,
 	type DelegationCwdPolicy,
+	type FleetViewMode,
 	isThinkingLevel,
+	type LifecycleArtifactsMode,
 	type SubagentAgentConfig,
 	type SubagentSettings,
 	type SubagentThinkingLevel,
@@ -157,6 +159,21 @@ export function normalizeSubagentSettings(value: unknown): SubagentSettings | un
 			if (typeof value.stateful.enabled !== "boolean") return undefined;
 			runtime.enabled = value.stateful.enabled;
 		}
+		if (hasOwn(value.stateful, "fleetView")) {
+			if (value.stateful.fleetView !== "off" && value.stateful.fleetView !== "active") {
+				return undefined;
+			}
+			runtime.fleetView = value.stateful.fleetView;
+		}
+		if (hasOwn(value.stateful, "lifecycleArtifacts")) {
+			if (
+				value.stateful.lifecycleArtifacts !== "off" &&
+				value.stateful.lifecycleArtifacts !== "metadata"
+			) {
+				return undefined;
+			}
+			runtime.lifecycleArtifacts = value.stateful.lifecycleArtifacts;
+		}
 		settings.stateful = runtime;
 	}
 	if (hasOwn(value, "consult")) {
@@ -290,6 +307,13 @@ export interface DelegationWorkflowSettingsSnapshot {
 export interface CompletionDeliverySettingsSnapshot {
 	path: string;
 	value: CompletionDelivery;
+	source: "default" | "user settings";
+	error?: string;
+}
+
+export interface StatefulFeatureSettingsSnapshot<T> {
+	path: string;
+	value: T;
 	source: "default" | "user settings";
 	error?: string;
 }
@@ -492,6 +516,36 @@ export function inspectCompletionDeliverySettings(): CompletionDeliverySettingsS
 	};
 }
 
+export function inspectFleetViewSettings(): StatefulFeatureSettingsSnapshot<FleetViewMode> {
+	return inspectStatefulFeature("fleetView", "off");
+}
+
+export function inspectLifecycleArtifactSettings(): StatefulFeatureSettingsSnapshot<LifecycleArtifactsMode> {
+	return inspectStatefulFeature("lifecycleArtifacts", "off");
+}
+
+function inspectStatefulFeature<T extends FleetViewMode | LifecycleArtifactsMode>(
+	field: "fleetView" | "lifecycleArtifacts",
+	defaultValue: T,
+): StatefulFeatureSettingsSnapshot<T> {
+	const inspected = inspectSubagentSettingsDocument();
+	if (!inspected.raw || !inspected.settings) {
+		return {
+			path: inspected.path,
+			value: defaultValue,
+			source: "default",
+			...(inspected.error ? { error: inspected.error } : {}),
+		};
+	}
+	const rawStateful = isPlainObject(inspected.raw.stateful) ? inspected.raw.stateful : undefined;
+	const value = inspected.settings.stateful?.[field] ?? defaultValue;
+	return {
+		path: inspected.path,
+		value: value as T,
+		source: rawStateful && hasOwn(rawStateful, field) ? "user settings" : "default",
+	};
+}
+
 export function resolveBlockingMaxParallelTasks(settings?: SubagentSettings): number {
 	return settings?.blocking?.maxParallelTasks ?? DEFAULT_MAX_PARALLEL_TASKS;
 }
@@ -585,6 +639,36 @@ export function updateCompletionDeliverySetting(value: CompletionDelivery): void
 					completionDelivery: value,
 				},
 			},
+			update.replaceCanonical,
+		);
+	});
+}
+
+export function updateFleetViewSetting(value: FleetViewMode): void {
+	if (value !== "off" && value !== "active") throw new Error("Invalid FleetView setting");
+	updateStatefulFeatureSetting("fleetView", value);
+}
+
+export function updateLifecycleArtifactSetting(value: LifecycleArtifactsMode): void {
+	if (value !== "off" && value !== "metadata") {
+		throw new Error("Invalid lifecycle artifact setting");
+	}
+	updateStatefulFeatureSetting("lifecycleArtifacts", value);
+}
+
+function updateStatefulFeatureSetting(
+	field: "fleetView" | "lifecycleArtifacts",
+	value: FleetViewMode | LifecycleArtifactsMode,
+): void {
+	withSettingsMutationLock(() => {
+		const update = readSettingsObjectForUpdate();
+		const raw = update.document;
+		const stateful = raw.stateful;
+		if (stateful !== undefined && !isPlainObject(stateful)) {
+			throw new Error(`Cannot update invalid ${SETTINGS_FILE} stateful settings`);
+		}
+		writeSettingsObjectUnlocked(
+			{ ...raw, stateful: { ...(stateful ?? {}), [field]: value } },
 			update.replaceCanonical,
 		);
 	});
