@@ -1,5 +1,11 @@
 # @narumitw/pi-file-context
 
+## 0.53.0
+
+### Minor Changes
+
+- 047f420: Make context selection a coherent next-prompt workflow with add-and-continue browsing, exact review before removal, visible capacity, adaptive preview help, and cancellable scanning from every explorer route.
+
 ## 0.52.0
 
 ### Minor Changes

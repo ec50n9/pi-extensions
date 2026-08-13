@@ -1,5 +1,13 @@
 # @narumitw/pi-chrome-devtools
 
+## 0.52.0
+
+### Minor Changes
+
+- eae42b5: Add validated JSON and `/chrome-devtools settings` controls for the DevTools endpoint, auto-launch policy, and browser executable.
+
+  Keep existing `PI_CHROME_DEVTOOLS_*` overrides temporarily, but warn that they are deprecated and should be migrated to `pi-chrome-devtools.json`.
+
 ## 0.51.0
 
 ### Minor Changes
