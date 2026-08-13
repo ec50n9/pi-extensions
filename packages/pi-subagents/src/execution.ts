@@ -50,6 +50,7 @@ import {
 } from "./execution-plan.js";
 import {
 	DEFAULT_MAX_CONTEXT_BYTES,
+	DEFAULT_MAX_OUTPUT_BYTES,
 	MAX_BLOCKING_PARALLEL_CONCURRENCY,
 	MAX_SUBAGENT_TIMEOUT_MS,
 	truncateUtf8,
@@ -1583,7 +1584,10 @@ export async function executeSubagent(
 				const output = getResultFinalOutput(result);
 				const error = result.errorMessage || result.stderr.trim();
 				const summaryText = failed ? formatResultFailure(result) : output || error;
-				const preview = truncateUtf8(summaryText, 160).text;
+				// fix: return full task outputs instead of 160-byte previews; tiny previews forced
+				// the parent agent to re-run the delegated work itself, doubling token spend.
+				// Still bounded by the standard 50KB tool-output cap.
+				const preview = truncateUtf8(summaryText, DEFAULT_MAX_OUTPUT_BYTES).text;
 				return `[${result.agent}] ${failed ? "failed" : "completed"}: ${preview || "(no output)"}`;
 			});
 			const aggregatorFailed = aggregatorResult ? isResultError(aggregatorResult) : false;
